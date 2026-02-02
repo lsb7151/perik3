@@ -357,19 +357,30 @@ class BleJsonClient(
             if (crlf >= 0) {
                 val line = buf.substring(0, crlf)
                 rxBuffer.delete(0, crlf + 2)
+
                 if (line.isNotBlank()) {
-                    enqueueRxPacket(line)
+                    val jsons = extractJsonObjectsFromText(line)
+                    if (jsons.isNotEmpty()) {
+                        jsons.forEach { enqueueRxPacket(it) }   // ✅ JSON만 넣는다
+                    } else {
+                        enqueueRxPacket(line)                   // JSON 없으면 그냥 로그용
+                    }
                 }
                 continue
             }
-
             // 2) LF 라인
             val lf = buf.indexOf("\n")
             if (lf >= 0) {
                 val line = buf.substring(0, lf).trimEnd('\r')
                 rxBuffer.delete(0, lf + 1)
+
                 if (line.isNotBlank()) {
-                    enqueueRxPacket(line)
+                    val jsons = extractJsonObjectsFromText(line)
+                    if (jsons.isNotEmpty()) {
+                        jsons.forEach { enqueueRxPacket(it) }
+                    } else {
+                        enqueueRxPacket(line)
+                    }
                 }
                 continue
             }
@@ -427,12 +438,58 @@ class BleJsonClient(
         }
     }
 
-    private fun enqueueRxPacket(packet: String) {
-        pendingRxPackets.add(packet)
+    private fun extractJsonObjectsFromText(text: String): List<String> {
+        val result = mutableListOf<String>()
 
-        // ✅ JSON이면 "가장 최신 1개"만 유지해서 200ms마다 callback으로 전달
-        if (packet.startsWith("{") && packet.endsWith("}")) {
-            latestJsonPacket = packet
+        val firstBrace = text.indexOf('{')
+        if (firstBrace < 0) return emptyList()
+
+        var depth = 0
+        var inString = false
+        var escape = false
+        var objStart = -1
+
+        for (i in firstBrace until text.length) {
+            val c = text[i]
+
+            if (inString) {
+                if (escape) {
+                    escape = false
+                } else {
+                    when (c) {
+                        '\\' -> escape = true
+                        '"' -> inString = false
+                    }
+                }
+                continue
+            }
+
+            when (c) {
+                '"' -> inString = true
+                '{' -> {
+                    if (depth == 0) objStart = i
+                    depth++
+                }
+                '}' -> {
+                    depth--
+                    if (depth == 0 && objStart >= 0) {
+                        result.add(text.substring(objStart, i + 1))
+                        objStart = -1
+                    }
+                }
+            }
+        }
+
+        return result
+    }
+
+    private fun enqueueRxPacket(packet: String) {
+        val trimmed = packet.trim()
+        pendingRxPackets.add(trimmed)
+
+        // ✅ JSON이면 "가장 최신 1개"만 유지
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            latestJsonPacket = trimmed
         }
 
         scheduleFlushIfNeeded()
@@ -533,33 +590,39 @@ class BleJsonClient(
 
     private fun flushNow() {
         isFlushScheduled = false
+
         val cb = currentCallback ?: return
 
-        // 1) BLE_LOG 묶음
-        if (pendingBleLogs.isNotEmpty()) {
-            val logs = pendingBleLogs.toList()
-            pendingBleLogs.clear()
-
-            val json = buildJsonLog("BLE_LOG", logs)
-            cb.onLog(json)
-            android.util.Log.d("PeriK3_BLE", json)
+        // 1) 200ms 동안 쌓인 BLE 내부 로그는 "로그용 JSON"으로 묶어서 onLog로만 보냄
+        val logsToFlush: List<String> = buildList {
+            while (pendingBleLogs.isNotEmpty()) add(pendingBleLogs.removeFirst())
         }
 
-        // 2) BLE_RX 묶음(라인/JSON 포함)
-        if (pendingRxPackets.isNotEmpty()) {
-            val rx = pendingRxPackets.toList()
-            pendingRxPackets.clear()
-
-            val json = buildJsonLog("BLE_RX", rx)
-            cb.onLog(json)
-            android.util.Log.d("PeriK3_BLE", json)
+        if (logsToFlush.isNotEmpty()) {
+            val escaped = logsToFlush.map { it.replace("\\", "\\\\").replace("\"", "\\\"") }
+            val payload = buildString {
+                append("{\"type\":\"BLE_LOG\",\"count\":")
+                append(escaped.size)
+                append(",\"logs\":[")
+                escaped.forEachIndexed { idx, s ->
+                    if (idx > 0) append(",")
+                    append("\"").append(s).append("\"")
+                }
+                append("]}")
+            }
+            // ✅ 로그는 onLog로만
+            mainHandler.post { cb.onLog(payload) }
+            android.util.Log.d("PeriK3_BLE", payload)
         }
 
-        // 3) JSON payload callback (가장 최신 1개만, 200ms에 1번)
-        latestJsonPacket?.let {
-            cb.onJsonStringReceived(it)
-        }
+        // 2) 200ms 동안 들어온 JSON 중 "마지막 1개"는 RAW 그대로 onJsonStringReceived로 보냄
+        val lastJson = latestJsonPacket
         latestJsonPacket = null
+
+        if (!lastJson.isNullOrBlank()) {
+            // ✅ 여기 절대 래핑하지 말고 RAW JSON 그대로 전달
+            mainHandler.post { cb.onJsonStringReceived(lastJson) }
+        }
     }
 
     private fun buildJsonLog(type: String, logs: List<String>): String {

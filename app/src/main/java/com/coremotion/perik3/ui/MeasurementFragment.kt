@@ -260,10 +260,11 @@ class MeasurementFragment : Fragment() {
         client.startScanAndConnect(adapter, object : BleJsonClient.Callback {
 
             override fun onLog(logLine: String) {
+
                 // ✅ 이제 200ms마다 JSON 묶음 1줄만 들어옴
                 // 필요하면 listViewRealtimeLogs에도 표시
                 // viewModel.addBleLog(logLine) 같은 식으로 연결해도 됨
-                android.util.Log.d("PeriK3_UI", logLine)
+            //    android.util.Log.d("PeriK3_UI", logLine)
             }
 
             override fun onConnectionStateChanged(isConnected: Boolean) {
@@ -273,6 +274,7 @@ class MeasurementFragment : Fragment() {
             }
 
             override fun onJsonStringReceived(jsonString: String) {
+                android.util.Log.d("PeriK3_UI", "JSON<< $jsonString")
                 viewModel.onRawPacketReceived(jsonString, System.currentTimeMillis())
             }
         })
