@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/transparent">
+
+    <!-- (옵션) 네가 배경 이미지를 깔고 싶으면 여기 ImageView로 깔면 됨 -->
+    <!--
+    <ImageView
+        android:id="@+id/illustrativeBackgroundImage"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="centerCrop"
+        android:src="@drawable/your_bg"
+        />
+    -->
+
+    <!-- SceneView는 Activity에서 동적으로 addView 할거라 컨테이너만 둠 -->
+    <FrameLayout
+        android:id="@+id/sceneContainer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@android:color/transparent" />
+
+    <!-- 디버그 텍스트(원하면) -->
+    <!--
+    <TextView
+        android:id="@+id/debugText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:textColor="#FFFFFF"
+        android:layout_margin="12dp"/>
+    -->
+
+</FrameLayout>

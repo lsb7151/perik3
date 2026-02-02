@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">PeriK3</string>
+    <string name="title_measurement">Measurement</string>
+    <string name="button_save_mock_db">DB 저장(모의)</string>
+</resources>
