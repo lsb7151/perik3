@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -264,7 +265,7 @@ class MeasurementFragment : Fragment() {
                 // ✅ 이제 200ms마다 JSON 묶음 1줄만 들어옴
                 // 필요하면 listViewRealtimeLogs에도 표시
                 // viewModel.addBleLog(logLine) 같은 식으로 연결해도 됨
-            //    android.util.Log.d("PeriK3_UI", logLine)
+                Log.d("PeriK3_UI", "onLog len=${logLine.length}")
             }
 
             override fun onConnectionStateChanged(isConnected: Boolean) {
@@ -274,7 +275,7 @@ class MeasurementFragment : Fragment() {
             }
 
             override fun onJsonStringReceived(jsonString: String) {
-                android.util.Log.d("PeriK3_UI", "JSON<< $jsonString")
+                Log.d("PeriK3_UI", "onJsonStringReceived len=${jsonString.length}")
                 viewModel.onRawPacketReceived(jsonString, System.currentTimeMillis())
             }
         })

@@ -92,33 +92,72 @@ class MeasurementViewModel : ViewModel() {
      * Fragment에서 "수신된 JSON 문자열"을 넣어줌
      * - receivedAtMs: System.currentTimeMillis() 로 넣어줘
      */
+// MeasurementViewModel.kt
     fun onRawPacketReceived(raw: String, receivedAtMs: Long) {
+        val trimmed0 = raw.trim()
+        if (!trimmed0.startsWith("{")) return
+
+        // 1) 만약 BLE_RX 래핑이면 packets에서 마지막 D를 뽑고,
+        // 2) 아니면 RAW 자체를 D 프레임으로 파싱 시도
+        val candidates = mutableListOf<String>()
+
         try {
-            val root = JSONObject(raw)
+            val root = JSONObject(trimmed0)
             val type = root.optString("type", "")
-            if (type != "BLE_RX") return
 
-            val packets = root.optJSONArray("packets") ?: return
-
-            // packets 중 마지막 D 프레임을 latest로 사용
-            var lastD: PeriK3JsonFrame? = null
-            for (i in 0 until packets.length()) {
-                val p = packets.optString(i, "")
-                if (!p.trim().startsWith("{")) continue
-
-                val frame = PeriK3JsonFrame.parseOrNull(p, receivedAtMs) ?: continue
-                if (frame.t == "D") lastD = frame
-            }
-
-            if (lastD != null) {
-                latestDFrame = lastD
+            if (type == "BLE_RX") {
+                val packets = root.optJSONArray("packets")
+                if (packets != null) {
+                    for (i in 0 until packets.length()) {
+                        val p = packets.optString(i, "").trim()
+                        if (p.startsWith("{")) candidates.add(p)
+                    }
+                }
+            } else {
+                candidates.add(trimmed0)
             }
         } catch (_: Exception) {
-            // batch json이 아닌 경우는 무시
+            // RAW가 JSONObject로 깨지면 그냥 raw 자체를 후보로
+            candidates.add(trimmed0)
         }
+
+        var lastD: PeriK3JsonFrame? = null
+        for (c in candidates) {
+            val normalized = normalizeMaybeEscapedJson(c) ?: continue
+            val frame = PeriK3JsonFrame.parseOrNull(normalized, receivedAtMs) ?: continue
+            if (frame.t == "D") lastD = frame
+        }
+
+        if (lastD != null) {
+            latestDFrame = lastD
+            latestSeq++              // ✅ 이게 없으면 200ms 루프에서 적용이 안 됨
+        }
+    }
+
+    /** "{\"t\":\"D\"...}" 처럼 escape된 JSON이면 1회 unescape 해서 정상 JSON으로 만든다 */
+    private fun normalizeMaybeEscapedJson(s: String): String? {
+        var t = s.trim()
+
+        // 양끝이 따옴표로 감싸진 형태까지 오는 경우 방어
+        if (t.length >= 2 && t.first() == '"' && t.last() == '"') {
+            t = t.substring(1, t.length - 1)
+        }
+
+        // \" 패턴이 보이면 unescape 1회
+        if (t.contains("\\\"")) {
+            t = t
+                .replace("\\\\", "\\")
+                .replace("\\\"", "\"")
+                .replace("\\r", "\r")
+                .replace("\\n", "\n")
+        }
+
+        if (!t.startsWith("{") || !t.endsWith("}")) return null
+        return t
     }
     private fun applyFrame(frame: PeriK3JsonFrame) {
         val tab = _selectedTab.value ?: 0
+        android.util.Log.d("PeriK3_UI", "APPLY tab=$tab ts=${frame.ts} F=${frame.F} LD=${frame.LD}")
 
         // ===== 1) 헤더 UI용 값 계산 =====
         when (tab) {
