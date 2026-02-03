@@ -153,6 +153,7 @@ class MeasurementFragment : Fragment() {
         binding.buttonZero.setOnClickListener {
             // 영점=캘리브레이션으로 연결 (문서에 따라 바뀌면 여기만 변경)
             bleJsonClient?.sendCalibrate()
+            bleJsonClient?.sendGetStatus()
         }
 
         binding.buttonStart.setOnClickListener {
@@ -161,6 +162,7 @@ class MeasurementFragment : Fragment() {
 
         binding.buttonEndAndSave.setOnClickListener {
             bleJsonClient?.sendStopMeasurement()
+            bleJsonClient?.sendResetSystem()
         }
     }
 
@@ -220,35 +222,40 @@ class MeasurementFragment : Fragment() {
     }
 
     private fun renderChart(entries: List<Entry>) {
+        val safe = entries.filter { it.x.isFinite() && it.y.isFinite() }
+        if (safe.size < 2) {
+            binding.lineChartRealtime.clear()
+            binding.lineChartRealtime.invalidate()
+            return
+        }
+
         val chart = binding.lineChartRealtime
         val lineData = chart.data ?: LineData().also { chart.data = it }
 
         val dataSet = if (lineData.dataSetCount == 0) {
-            LineDataSet(ArrayList(entries), "data").apply {
-                setDrawValues(false)   // ✅ 여기
+            LineDataSet(ArrayList(safe), "data").apply {
+                setDrawValues(false)
                 setDrawCircles(false)
                 lineWidth = 2f
             }.also { lineData.addDataSet(it) }
         } else {
-            (lineData.getDataSetByIndex(0) as LineDataSet).apply {
-                setDrawValues(false)   // ✅ 매번 꺼주기 (핵심)
-                setDrawCircles(false)
-            }
+            (lineData.getDataSetByIndex(0) as LineDataSet)
         }
 
-        // ✅ MPAndroidChart는 values에 외부 리스트를 바로 물리면 위험할 수 있어서 복사본 사용 추천
-        dataSet.values = ArrayList(entries)
+        dataSet.values = ArrayList(safe)
         dataSet.setDrawValues(false)
         dataSet.setDrawCircles(false)
-        lineData.setDrawValues(false)  // ✅ 이것도 매번
+
         lineData.notifyDataChanged()
         chart.notifyDataSetChanged()
 
         chart.setVisibleXRangeMaximum(12f)
-        if (entries.isNotEmpty()) chart.moveViewToX(entries.last().x)
+        chart.moveViewToX(safe.last().x)
 
         chart.invalidate()
     }
+
+    private fun Float.isFinite(): Boolean = !this.isNaN() && !this.isInfinite()
 
     private fun startBle() {
         val adapter = bluetoothAdapter ?: run {
