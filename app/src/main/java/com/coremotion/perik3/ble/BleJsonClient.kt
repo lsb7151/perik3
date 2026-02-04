@@ -22,37 +22,44 @@ class BleJsonClient(
     interface Callback {
         fun onLog(logLine: String)
         fun onConnectionStateChanged(isConnected: Boolean)
-        fun onJsonStringReceived(jsonString: String)
+        fun onJsonStringReceived(jsonString: String) // ✅ 정상 JSON만
     }
 
     // ============================================================
-    // 설정
+    // Scan/Connect 설정
     // ============================================================
-
+    private val logLock = Any()
     private val allowedDeviceNamePrefix: String = "JDY"
     private val minimumAcceptableRssi: Int = -85
     private val shouldLogOnlyJdyDevices: Boolean = true
     private val scanTimeoutMillis: Long = 15_000L
+
+    // ✅ UI로 전달하는 flush 주기
     private val flushIntervalMs: Long = 200L
 
     // ============================================================
-    // Thread / Handler
+    // Thread/Handler
     // ============================================================
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    private val workerThread = HandlerThread("BleJsonClientWorker").apply { start() }
+    private val workerThread = HandlerThread("BleJsonClientWorker").apply {
+        uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, e ->
+            android.util.Log.e("PeriK3_BLE_RAW", "Worker crashed", e)
+        }
+        start()
+    }
     private val workerHandler = Handler(workerThread.looper)
 
     // ============================================================
-    // BLE runtime
+    // Runtime State
     // ============================================================
 
     private var bluetoothLeScanner = (applicationContext.getSystemService(BluetoothManager::class.java))
         .adapter
         .bluetoothLeScanner
 
-    @Volatile private var currentCallback: Callback? = null
+    private var currentCallback: Callback? = null
 
     private var isScanning: Boolean = false
     private var isConnecting: Boolean = false
@@ -65,44 +72,37 @@ class BleJsonClient(
     private var lastSelectedDeviceAddress: String = ""
     private var lastSelectedDeviceRssi: Int = -999
 
-    // ============================================================
-    // Buffers (worker thread에서만 변경)
-    // ============================================================
-
+    // ✅ RX 버퍼 (worker thread only)
     private val rxBuffer = StringBuilder()
 
-    private val pendingBleLogs: ArrayDeque<String> = ArrayDeque()
-    private val pendingRxPackets: ArrayDeque<String> = ArrayDeque()
+    // ✅ 200ms마다 마지막 정상 JSON 1개만 전달
+    @Volatile private var latestValidJson: String? = null
 
-    // ✅ 동시성 보호용(혹시라도 logInternal이 main에서 들어오면 대비)
-    private val lock = Any()
+    // ✅ 로그도 200ms마다 묶어서 전달 (메인 post 폭주 방지)
+    private val pendingLogs: ArrayDeque<String> = ArrayDeque()
 
-    // ============================================================
-    // Timer flush (200ms 고정 tick)
-    // ============================================================
+    // ✅ 버퍼 폭주 방지
+    private val maxRxBufferChars = 200_000
+    private val keepTailChars = 20_000
 
-    private val flushTicker = object : Runnable {
-        override fun run() {
-            flushNowOnWorker()
-            workerHandler.postDelayed(this, flushIntervalMs)
-        }
-    }
-
-    init {
-        // ✅ 200ms 주기 flush 시작
-        workerHandler.postDelayed(flushTicker, flushIntervalMs)
-        Log.d("PeriK3_BLE_RAW", "BleJsonClient init, workerThread started")
-    }
-
-    private val scanTimeoutRunnable: Runnable = Runnable {
+    private val scanTimeoutRunnable = Runnable {
         if (isScanning) {
-            logInternal("SCAN timeout -> stop")
+            enqueueLog("SCAN 타임아웃 → 중지")
             stopScanInternal()
         }
     }
 
+    // ✅ flush 루프(고정 주기) : “한번 꼬이면 멈춤” 방지
+    @Volatile private var flushLoopStarted = false
+    private val flushRunnable = object : Runnable {
+        override fun run() {
+            flushOnceWorker()
+            workerHandler.postDelayed(this, flushIntervalMs)
+        }
+    }
+
     // ============================================================
-    // 외부 API
+    // Public API
     // ============================================================
 
     @SuppressLint("MissingPermission")
@@ -110,21 +110,25 @@ class BleJsonClient(
         bluetoothAdapter: BluetoothAdapter,
         callback: Callback
     ) {
-        Log.d("PeriK3_BLE_RAW", "startScanAndConnect() called") // ✅ 여기부터 안 뜨면 호출 자체가 안 됨
         currentCallback = callback
 
+        if (!flushLoopStarted) {
+            flushLoopStarted = true
+            workerHandler.postDelayed(flushRunnable, flushIntervalMs)
+        }
+
         if (isScanning || isConnecting || connectedBluetoothGatt != null) {
-            logInternal("이미 스캔/연결 중 또는 연결 상태입니다. stopAndClose 후 재시도하세요.")
+            enqueueLog("이미 스캔/연결 중 또는 연결 상태입니다. stopAndClose 후 재시도하세요.")
             return
         }
 
         bluetoothLeScanner = bluetoothAdapter.bluetoothLeScanner
         if (bluetoothLeScanner == null) {
-            logInternal("BluetoothLeScanner를 가져오지 못했습니다.")
+            enqueueLog("BluetoothLeScanner를 가져오지 못했습니다.")
             return
         }
 
-        logInternal("SCAN start prefix='$allowedDeviceNamePrefix' minRssi=$minimumAcceptableRssi")
+        enqueueLog("SCAN 시작 (allowedPrefix='$allowedDeviceNamePrefix', minRssi=$minimumAcceptableRssi)")
         isScanning = true
         isConnecting = false
 
@@ -142,35 +146,27 @@ class BleJsonClient(
 
     @SuppressLint("MissingPermission")
     fun stopAndClose() {
-        Log.d("PeriK3_BLE_RAW", "stopAndClose() called")
         stopScanInternal()
-        disconnectAndCloseGatt("stopAndClose")
+        disconnectAndCloseGatt("stopAndClose 호출")
         currentCallback = null
-
-        // ticker 중단 + thread 종료
-        workerHandler.removeCallbacks(flushTicker)
-        workerThread.quitSafely()
+        // ✅ workerThread는 여기서 quit하지 말자 (예상치 못한 중단 방지)
+        // workerThread.quitSafely()
     }
 
     // ============================================================
-    // ScanCallback
+    // Scan
     // ============================================================
 
     private val scanCallback: ScanCallback = object : ScanCallback() {
-
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device: BluetoothDevice = result.device ?: return
 
-            val deviceName: String =
-                device.name
-                    ?: result.scanRecord?.deviceName
-                    ?: "UNKNOWN"
-
-            val deviceAddress: String = device.address ?: "NO_ADDRESS"
-            val rssi: Int = result.rssi
+            val deviceName = device.name ?: result.scanRecord?.deviceName ?: "UNKNOWN"
+            val deviceAddress = device.address ?: "NO_ADDRESS"
+            val rssi = result.rssi
 
             if (!shouldLogOnlyJdyDevices || isJdyDeviceName(deviceName)) {
-                logInternal("SCAN found name=$deviceName addr=$deviceAddress rssi=$rssi")
+                enqueueLog("SCAN 발견: name=$deviceName addr=$deviceAddress rssi=$rssi")
             }
 
             if (!isJdyDeviceName(deviceName)) return
@@ -181,14 +177,13 @@ class BleJsonClient(
             lastSelectedDeviceAddress = deviceAddress
             lastSelectedDeviceRssi = rssi
 
-            logInternal("MATCH -> connect try name=$deviceName addr=$deviceAddress rssi=$rssi")
-
+            enqueueLog("✅ JDY 조건 일치 → 연결 시도: name=$deviceName addr=$deviceAddress rssi=$rssi")
             stopScanInternal()
             connectToDevice(device)
         }
 
         override fun onScanFailed(errorCode: Int) {
-            logInternal("SCAN failed errorCode=$errorCode")
+            enqueueLog("SCAN 실패 errorCode=$errorCode")
             isScanning = false
         }
     }
@@ -202,16 +197,16 @@ class BleJsonClient(
     @SuppressLint("MissingPermission")
     private fun stopScanInternal() {
         if (!isScanning) return
-        mainHandler.removeCallbacks(scanTimeoutRunnable)
 
+        mainHandler.removeCallbacks(scanTimeoutRunnable)
         try {
             bluetoothLeScanner?.stopScan(scanCallback)
         } catch (e: Exception) {
-            logInternal("stopScan exception: ${e.message}")
+            enqueueLog("stopScan 예외: ${e.message}")
         }
 
         isScanning = false
-        logInternal("SCAN stopped")
+        enqueueLog("SCAN 중지")
     }
 
     // ============================================================
@@ -221,8 +216,6 @@ class BleJsonClient(
     @SuppressLint("MissingPermission")
     private fun connectToDevice(device: BluetoothDevice) {
         isConnecting = true
-        Log.d("PeriK3_BLE_RAW", "connectGatt() called")
-
         val gatt = if (Build.VERSION.SDK_INT >= 23) {
             device.connectGatt(applicationContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         } else {
@@ -235,35 +228,32 @@ class BleJsonClient(
 
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            Log.d("PeriK3_BLE_RAW", "onConnectionStateChange status=$status newState=$newState")
-
             val ok = status == BluetoothGatt.GATT_SUCCESS
-            logInternal("GATT state status=$status ok=$ok newState=$newState")
+            enqueueLog("GATT 상태변경: status=$status success=$ok newState=$newState")
 
             if (!ok) {
-                mainHandler.post { currentCallback?.onConnectionStateChanged(false) }
-                disconnectAndCloseGatt("connect fail status=$status")
+                safePostMain { currentCallback?.onConnectionStateChanged(false) }
+                disconnectAndCloseGatt("연결 실패(status=$status)")
                 return
             }
 
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 isConnecting = false
-                mainHandler.post { currentCallback?.onConnectionStateChanged(true) }
-                val started = gatt.discoverServices()
-                logInternal("discoverServices started=$started")
+                enqueueLog("✅ GATT CONNECTED: name=$lastSelectedDeviceName addr=$lastSelectedDeviceAddress rssi=$lastSelectedDeviceRssi")
+                safePostMain { currentCallback?.onConnectionStateChanged(true) }
+                enqueueLog("discoverServices started=${gatt.discoverServices()}")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                mainHandler.post { currentCallback?.onConnectionStateChanged(false) }
-                disconnectAndCloseGatt("disconnected")
+                enqueueLog("GATT DISCONNECTED")
+                safePostMain { currentCallback?.onConnectionStateChanged(false) }
+                disconnectAndCloseGatt("연결 해제")
             }
         }
 
         @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            Log.d("PeriK3_BLE_RAW", "onServicesDiscovered status=$status")
-            logInternal("onServicesDiscovered status=$status")
-
+            enqueueLog("onServicesDiscovered status=$status")
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                disconnectAndCloseGatt("service discover fail status=$status")
+                disconnectAndCloseGatt("서비스 탐색 실패(status=$status)")
                 return
             }
 
@@ -272,21 +262,20 @@ class BleJsonClient(
             val notifyChar = fixedChar ?: findFirstNotifiableCharacteristic(gatt)
 
             if (notifyChar == null) {
-                logInternal("NO notifiable characteristic")
+                enqueueLog("❌ NOTIFY 가능한 Characteristic을 찾지 못했습니다.")
                 return
             }
 
             subscribedNotifyCharacteristic = notifyChar
             discoveredWriteCharacteristic = notifyChar
 
-            logInternal("notify char=${notifyChar.uuid} service=${notifyChar.service.uuid}")
+            enqueueLog("✅ NOTIFY 대상: service=${notifyChar.service.uuid} char=${notifyChar.uuid}")
             subscribeToNotifications(gatt, notifyChar)
         }
 
-        @Deprecated("Android 12 이하")
+        @Deprecated("Android 12 이하 호환")
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            val v = characteristic.value ?: return
-            onCharacteristicChanged(gatt, characteristic, v)
+            characteristic.value?.let { handleIncomingBytes(it) }
         }
 
         override fun onCharacteristicChanged(
@@ -294,22 +283,17 @@ class BleJsonClient(
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
-            // ✅ RX는 worker로 넘겨서 처리 (메인/BT스레드 블로킹 방지)
-            workerHandler.post {
-                handleIncomingBytesOnWorker(value)
-            }
+            handleIncomingBytes(value)
         }
 
         @SuppressLint("MissingPermission")
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            Log.d("PeriK3_BLE_RAW", "onDescriptorWrite status=$status desc=${descriptor.uuid}")
-            logInternal("onDescriptorWrite status=$status desc=${descriptor.uuid}")
-
+            enqueueLog("onDescriptorWrite status=$status desc=${descriptor.uuid}")
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                logInternal("NOTIFY subscribed -> sendGetStatus()")
+                enqueueLog("✅ NOTIFY 구독 완료 -> sendGetStatus()")
                 sendGetStatus()
             } else {
-                logInternal("NOTIFY subscribe fail status=$status")
+                enqueueLog("❌ NOTIFY 구독 실패 status=$status")
             }
         }
     }
@@ -328,81 +312,102 @@ class BleJsonClient(
 
     @SuppressLint("MissingPermission")
     private fun subscribeToNotifications(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-        val setOk = gatt.setCharacteristicNotification(characteristic, true)
-        logInternal("setCharacteristicNotification ok=$setOk")
+        val ok = gatt.setCharacteristicNotification(characteristic, true)
+        enqueueLog("setCharacteristicNotification ok=$ok")
 
         val cccd = characteristic.getDescriptor(UUID.fromString(CCCD_UUID_STRING))
         if (cccd == null) {
-            logInternal("CCCD not found (0x2902)")
+            enqueueLog("❌ CCCD descriptor(0x2902) 없음")
             return
         }
 
         val hasNotify = characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
-        cccd.value = if (hasNotify) {
-            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-        } else {
-            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-        }
+        cccd.value = if (hasNotify) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        else BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
 
-        val started = gatt.writeDescriptor(cccd)
-        logInternal("writeDescriptor(CCCD) started=$started")
+        enqueueLog("writeDescriptor(CCCD) started=${gatt.writeDescriptor(cccd)}")
     }
 
     // ============================================================
-    // RX parsing (worker only)
+    // RX 처리 (worker thread)
     // ============================================================
 
-    private fun handleIncomingBytesOnWorker(value: ByteArray) {
-        val chunk = try {
-            String(value, Charsets.UTF_8)
-        } catch (_: Exception) {
-            value.joinToString(" ") { "%02X".format(it) }
-        }
-        if (chunk.isEmpty()) return
+    private fun handleIncomingBytes(value: ByteArray) {
+        workerHandler.post {
+            val chunk = try {
+                String(value, Charsets.UTF_8)
+            } catch (_: Exception) {
+                value.joinToString(" ") { "%02X".format(it) }
+            }
+            if (chunk.isEmpty()) return@post
 
-        rxBuffer.append(chunk)
-        extractPacketsFromBufferOnWorker()
+            rxBuffer.append(chunk)
+
+            if (rxBuffer.length > maxRxBufferChars) {
+                rxBuffer.delete(0, rxBuffer.length - keepTailChars)
+                enqueueLog("RX buffer trimmed (too large)")
+            }
+
+            extractJsonObjectsFromBufferWorker()
+        }
     }
 
-    private fun extractPacketsFromBufferOnWorker() {
-        while (true) {
+    // ============================================================
+    // ✅ [핵심 수정] 좀비 데이터 자동 복구 파서
+    // 괄호가 안 닫힌 채로 너무 오래 버티면 강제로 끊어냅니다.
+    // ============================================================
+    private fun extractJsonObjectsFromBufferWorker() {
+        var loopSafetyCount = 0
+        val maxLoopsPerCall = 50
+
+        // JSON 하나가 4000자를 넘을 리 없다고 가정 (BLE 패킷 특성상)
+        // 이 길이를 넘도록 '}'가 안 나오면 앞부분을 잘라버림
+        val maxSingleJsonLength = 4096
+
+        while (loopSafetyCount < maxLoopsPerCall) {
+            loopSafetyCount++
+
             val buf = rxBuffer.toString()
-
-            val crlf = buf.indexOf("\r\n")
-            if (crlf >= 0) {
-                val line = buf.substring(0, crlf)
-                rxBuffer.delete(0, crlf + 2)
-                handleLineOnWorker(line)
-                continue
-            }
-
-            val lf = buf.indexOf("\n")
-            if (lf >= 0) {
-                val line = buf.substring(0, lf).trimEnd('\r')
-                rxBuffer.delete(0, lf + 1)
-                handleLineOnWorker(line)
-                continue
-            }
-
             val start = buf.indexOf('{')
-            if (start < 0) break
 
-            // brace 기반 JSON object 추출
+            // 1. 여는 괄호가 아예 없으면? -> 데이터가 더 쌓일 때까지 대기
+            if (start < 0) {
+                // 단, 쓰레기 데이터가 너무 쌓이면 정리
+                if (rxBuffer.length > keepTailChars) {
+                    rxBuffer.delete(0, rxBuffer.length - keepTailChars)
+                    Log.w("PeriK3_BLE_RAW", "Garbage trimmed (No '{' found)")
+                }
+                return
+            }
+
+            // 2. '{' 앞부분의 쓰레기 데이터 제거
+            if (start > 0) {
+                rxBuffer.delete(0, start)
+                continue // 다시 루프 시작 (인덱스 0이 '{'가 됨)
+            }
+
+            // 3. 괄호 짝 맞추기 시작
             var depth = 0
             var inString = false
             var escape = false
             var endIndex = -1
 
-            for (i in start until buf.length) {
-                val c = buf[i]
+            // 안전장치: 너무 길어지면 포기하기 위한 플래그
+            var isTooLong = false
+
+            for (i in 0 until rxBuffer.length) {
+                // 제한 길이 초과 체크
+                if (i > maxSingleJsonLength) {
+                    isTooLong = true
+                    break
+                }
+
+                val c = rxBuffer[i]
                 if (inString) {
-                    if (escape) {
-                        escape = false
-                    } else {
-                        when (c) {
-                            '\\' -> escape = true
-                            '"' -> inString = false
-                        }
+                    if (escape) escape = false
+                    else when (c) {
+                        '\\' -> escape = true
+                        '"' -> inString = false
                     }
                 } else {
                     when (c) {
@@ -410,6 +415,7 @@ class BleJsonClient(
                         '{' -> depth++
                         '}' -> {
                             depth--
+                            // 깊이가 0이 되면 하나의 JSON 완성
                             if (depth == 0) {
                                 endIndex = i
                                 break
@@ -419,212 +425,167 @@ class BleJsonClient(
                 }
             }
 
+            // 4-A. 너무 길어져서 강제 폐기 (좀비 데이터 탈출)
+            if (isTooLong) {
+                Log.e("PeriK3_BLE_RAW", "🚨 JSON Too Long/Corrupted (Zombie data). Dropping start.")
+                // 맨 앞의 '{' 하나를 지워서 다음 '{'를 찾도록 유도
+                rxBuffer.delete(0, 1)
+                continue
+            }
+
+            // 4-B. 아직 닫는 괄호가 안 옴 (데이터 수신 중)
             if (endIndex < 0) {
-                if (rxBuffer.length > 120_000) {
-                    rxBuffer.delete(0, rxBuffer.length - 20_000)
-                }
-                break
+                return
             }
 
-            val json = buf.substring(start, endIndex + 1)
-            rxBuffer.delete(0, endIndex + 1)
-            enqueueRxPacketOnWorker(json)
-        }
+            // 5. JSON 추출 성공
+            val json = rxBuffer.substring(0, endIndex + 1).trim()
+            rxBuffer.delete(0, endIndex + 1) // 추출한 부분 버퍼에서 삭제
 
-        if (rxBuffer.length > 200_000) rxBuffer.setLength(0)
-    }
-
-    private fun handleLineOnWorker(line: String) {
-        val t = line.trim()
-        if (t.isEmpty()) return
-
-        val jsons = extractJsonObjectsLenient(t)
-        if (jsons.isNotEmpty()) {
-            jsons.forEach { enqueueRxPacketOnWorker(it) }
-        } else {
-            enqueueRxPacketOnWorker(t) // JSON 아니면 그냥 text로도 넣음
-        }
-    }
-
-    private fun extractJsonObjectsLenient(text: String): List<String> {
-        val out = mutableListOf<String>()
-        var depth = 0
-        var start = -1
-        for (i in text.indices) {
-            when (text[i]) {
-                '{' -> { if (depth == 0) start = i; depth++ }
-                '}' -> {
-                    if (depth > 0) depth--
-                    if (depth == 0 && start >= 0) {
-                        out.add(text.substring(start, i + 1))
-                        start = -1
-                    }
+            // 유효성 검사 및 전송
+            val ok = try {
+                if (!json.startsWith("{") || !json.endsWith("}")) false
+                else {
+                    JSONObject(json) // 파싱 확인
+                    true
                 }
+            } catch (_: Exception) {
+                false
+            }
+
+            if (ok) {
+                Log.d("PeriK3_BLE_RAW", "✅ JSON OK: ${json.take(60)}...") // Logcat에서 확인
+                latestValidJson = json
+            } else {
+                Log.w("PeriK3_BLE_RAW", "⚠️ Broken JSON Skipped")
             }
         }
-        return out
-    }
-
-    private fun enqueueRxPacketOnWorker(packet: String) {
-        val trimmed = packet.trim()
-        if (trimmed.isEmpty()) return
-
-        synchronized(lock) {
-            pendingRxPackets.addLast(trimmed)
-            while (pendingRxPackets.size > 600) pendingRxPackets.removeFirst()
-        }
-
-        // 유효 JSON 여부는 "로그용"으로만 체크(드랍 표시)
-        val normalized = normalizeMaybeEscapedJson(trimmed)
-        if (normalized != null) {
-            val ok = try { JSONObject(normalized); true } catch (_: Exception) { false }
-            if (!ok) logInternal("RX invalid json dropped: ${trimmed.take(240)}")
-        }
-    }
-
-    private fun normalizeMaybeEscapedJson(s: String): String? {
-        var t = s.trim()
-        if (t.length >= 2 && t.first() == '"' && t.last() == '"') {
-            t = t.substring(1, t.length - 1)
-        }
-        if (t.contains("\\\"")) {
-            t = t
-                .replace("\\\\", "\\")
-                .replace("\\\"", "\"")
-                .replace("\\r", "\r")
-                .replace("\\n", "\n")
-        }
-        if (!t.startsWith("{") || !t.endsWith("}")) return null
-        return t
     }
 
     // ============================================================
-    // TX
+    // flush (worker -> main) : 200ms 고정 주기
+    // ============================================================
+
+    private fun flushOnceWorker() {
+        val logs = mutableListOf<String>()
+
+        synchronized(logLock) {
+            while (pendingLogs.isNotEmpty()) {
+                logs.add(pendingLogs.removeFirst())
+            }
+        }
+
+        val lastJson = latestValidJson
+        latestValidJson = null
+
+        if (logs.isEmpty() && lastJson.isNullOrBlank()) return
+
+        val cb = currentCallback ?: return
+
+        safePostMain {
+            try {
+                if (logs.isNotEmpty()) {
+                    cb.onLog(buildBleLogPayload(logs))
+                }
+                if (!lastJson.isNullOrBlank()) {
+                    cb.onJsonStringReceived(lastJson)
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("PeriK3_BLE_RAW", "Callback error", e)
+            }
+        }
+    }
+
+    private fun buildBleLogPayload(logs: List<String>): String {
+        fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\r","\\r").replace("\n","\\n")
+        val joined = logs.joinToString(",") { "\"${esc(it)}\"" }
+        return "{\"type\":\"BLE_LOG\",\"count\":${logs.size},\"logs\":[${joined}]}"
+    }
+
+    private fun enqueueLog(msg: String) {
+        val shortMsg = if (msg.length > 250) msg.take(250) + "..." else msg
+        synchronized(logLock) {
+            pendingLogs.addLast(shortMsg)
+            while (pendingLogs.size > 200) {
+                pendingLogs.removeFirst()
+            }
+        }
+    }
+
+    private fun safePostMain(block: () -> Unit) {
+        try {
+            mainHandler.post { block() }
+        } catch (e: Exception) {
+            android.util.Log.e("PeriK3_BLE_RAW", "main post failed", e)
+        }
+    }
+
+    // ============================================================
+    // TX (기존 유지)
     // ============================================================
 
     @SuppressLint("MissingPermission")
     fun writeAsciiCommand(commandString: String): Boolean {
         val gatt = connectedBluetoothGatt ?: run {
-            logInternal("WRITE fail: no gatt")
+            enqueueLog("❌ WRITE 실패: GATT 없음(미연결)")
             return false
         }
-
         val ch = discoveredWriteCharacteristic ?: subscribedNotifyCharacteristic ?: run {
-            logInternal("WRITE fail: no characteristic")
+            enqueueLog("❌ WRITE 실패: write characteristic 없음")
             return false
         }
 
-        ch.value = commandString.toByteArray(Charset.forName("UTF-8"))
-        ch.writeType =
-            if (ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0)
-                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            else
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        val payloadBytes = commandString.toByteArray(Charset.forName("UTF-8"))
+        ch.value = payloadBytes
+
+        ch.writeType = if (ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) {
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        } else {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        }
 
         val started = gatt.writeCharacteristic(ch)
-        logInternal("WRITE: '$commandString' started=$started")
+        enqueueLog("WRITE: '$commandString' started=$started")
         return started
     }
 
-    fun sendMcuCommandPacket(commandId: Int, stateId: Int = 0, p1: Int = 0, p2: Int = 0): Boolean {
-        val payload = "${commandId},${stateId},${p1},${p2}"
-        val cs = calculateXorChecksumOfAscii(payload).toString(16).uppercase().padStart(2, '0')
-        val packet = "\$${payload}*${cs}\r\n"
-        logInternal("MCU TX: ${packet.replace("\r", "\\r").replace("\n", "\\n")}")
+    fun sendMcuCommandPacket(commandId: Int, stateId: Int = 0, parameter1: Int = 0, parameter2: Int = 0): Boolean {
+        val payload = "${commandId},${stateId},${parameter1},${parameter2}"
+        val checksum = calculateXorChecksumOfAscii(payload).toString(16).uppercase().padStart(2, '0')
+        val packet = "\$${payload}*${checksum}\r\n"
+        enqueueLog("MCU TX: ${packet.replace("\r", "\\r").replace("\n", "\\n")}")
         return writeAsciiCommand(packet)
     }
 
     private fun calculateXorChecksumOfAscii(payloadText: String): Int {
         var checksumValue = 0
-        for (b in payloadText.toByteArray(Charsets.US_ASCII)) {
-            checksumValue = checksumValue xor (b.toInt() and 0xFF)
-        }
+        val asciiBytes = payloadText.toByteArray(Charsets.US_ASCII)
+        for (b in asciiBytes) checksumValue = checksumValue xor (b.toInt() and 0xFF)
         return checksumValue and 0xFF
     }
 
-    fun sendStartMeasurement(): Boolean = sendMcuCommandPacket(0)
-    fun sendStopMeasurement(): Boolean = sendMcuCommandPacket(1)
-    fun sendResetSystem(): Boolean = sendMcuCommandPacket(2)
-    fun sendGetStatus(): Boolean = sendMcuCommandPacket(3)
-    fun sendSetMode(stateId: Int = 0, p1: Int = 0, p2: Int = 0): Boolean = sendMcuCommandPacket(4, stateId, p1, p2)
-    fun sendCalibrate(): Boolean = sendMcuCommandPacket(5)
-    fun sendGetState(stateId: Int = 0): Boolean = sendMcuCommandPacket(6, stateId)
+    fun sendStartMeasurement(): Boolean = sendMcuCommandPacket(commandId = 0)
+    fun sendStopMeasurement(): Boolean = sendMcuCommandPacket(commandId = 1)
+    fun sendResetSystem(): Boolean = sendMcuCommandPacket(commandId = 2)
+    fun sendGetStatus(): Boolean = sendMcuCommandPacket(commandId = 3)
+    fun sendSetMode(stateId: Int = 0, param1: Int = 0, param2: Int = 0): Boolean =
+        sendMcuCommandPacket(commandId = 4, stateId = stateId, parameter1 = param1, parameter2 = param2)
+    fun sendCalibrate(): Boolean = sendMcuCommandPacket(commandId = 5)
+    fun sendGetState(stateId: Int = 0): Boolean = sendMcuCommandPacket(commandId = 6, stateId = stateId)
 
     // ============================================================
-    // close
+    // GATT 정리
     // ============================================================
 
     @SuppressLint("MissingPermission")
     private fun disconnectAndCloseGatt(reason: String) {
-        logInternal("disconnectAndCloseGatt: $reason")
+        enqueueLog("disconnectAndCloseGatt: $reason")
         try { connectedBluetoothGatt?.disconnect() } catch (_: Exception) {}
         try { connectedBluetoothGatt?.close() } catch (_: Exception) {}
         connectedBluetoothGatt = null
         subscribedNotifyCharacteristic = null
         discoveredWriteCharacteristic = null
         isConnecting = false
-    }
-
-    // ============================================================
-    // flush (worker tick)
-    // ============================================================
-
-    private fun flushNowOnWorker() {
-        val cb = currentCallback ?: return
-
-        val logsToFlush = mutableListOf<String>()
-        val rxToFlush = mutableListOf<String>()
-
-        synchronized(lock) {
-            while (pendingBleLogs.isNotEmpty()) logsToFlush.add(pendingBleLogs.removeFirst())
-            while (pendingRxPackets.isNotEmpty()) rxToFlush.add(pendingRxPackets.removeFirst())
-        }
-
-        if (logsToFlush.isNotEmpty()) {
-            val payload = buildBleLogPayload(logsToFlush)
-            Log.d("PeriK3_BLE", payload)
-            mainHandler.post { cb.onLog(payload) }
-        }
-
-        if (rxToFlush.isNotEmpty()) {
-            val payload = buildBleRxPayload(rxToFlush)
-            // 길이만 출력 (전체 찍으면 logcat에서 안 보이는 경우 많음)
-            Log.d("PeriK3_BLE_RAW", "flush RX batch count=${rxToFlush.size} len=${payload.length}")
-            mainHandler.post { cb.onJsonStringReceived(payload) }
-        }
-    }
-
-    private fun buildBleLogPayload(logs: List<String>): String {
-        fun esc(s: String) =
-            s.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\r", "\\r")
-                .replace("\n", "\\n")
-
-        val joined = logs.joinToString(",") { "\"${esc(it)}\"" }
-        return "{\"type\":\"BLE_LOG\",\"count\":${logs.size},\"logs\":[${joined}]}"
-    }
-
-    private fun buildBleRxPayload(packets: List<String>): String {
-        fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
-        val joined = packets.joinToString(",") { "\"${esc(it)}\"" }
-        return "{\"type\":\"BLE_RX\",\"count\":${packets.size},\"packets\":[${joined}]}"
-    }
-
-    // ============================================================
-    // logInternal (즉시 RAW 로그 + 큐 적재)
-    // ============================================================
-
-    private fun logInternal(message: String) {
-        // ✅ flush 기다리기 전에 "호출됐는지"부터 확실히 보이게
-        Log.d("PeriK3_BLE_RAW", message)
-
-        workerHandler.post {
-            synchronized(lock) {
-                pendingBleLogs.addLast(message)
-                while (pendingBleLogs.size > 600) pendingBleLogs.removeFirst()
-            }
-        }
     }
 
     companion object {

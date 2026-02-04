@@ -34,7 +34,7 @@ class MeasurementViewModel : ViewModel() {
 
     private val _t3BipolarValue = MutableLiveData(0f)  // -1..1
     val t3BipolarValue: LiveData<Float> = _t3BipolarValue
-
+    private var firstDeviceTs: Long = -1L
     // ====== 우측 로그(표) ======
     private val _logRows = MutableLiveData<List<MeasurementLogRow>>(emptyList())
     val logRows: LiveData<List<MeasurementLogRow>> = _logRows
@@ -92,95 +92,72 @@ class MeasurementViewModel : ViewModel() {
      * Fragment에서 "수신된 JSON 문자열"을 넣어줌
      * - receivedAtMs: System.currentTimeMillis() 로 넣어줘
      */
-// MeasurementViewModel.kt
     fun onRawPacketReceived(raw: String, receivedAtMs: Long) {
-        val trimmed0 = raw.trim()
-        if (!trimmed0.startsWith("{")) return
-
-        // 1) 만약 BLE_RX 래핑이면 packets에서 마지막 D를 뽑고,
-        // 2) 아니면 RAW 자체를 D 프레임으로 파싱 시도
-        val candidates = mutableListOf<String>()
+        val text = raw.trim()
+        if (text.isEmpty()) return
 
         try {
-            val root = JSONObject(trimmed0)
-            val type = root.optString("type", "")
+            val root = JSONObject(text)
 
-            if (type == "BLE_RX") {
-                val packets = root.optJSONArray("packets")
-                if (packets != null) {
-                    for (i in 0 until packets.length()) {
-                        val p = packets.optString(i, "").trim()
-                        if (p.startsWith("{")) candidates.add(p)
-                    }
+            // 1) (기존) BLE_RX 배치 포맷 지원
+            if (root.optString("type", "") == "BLE_RX") {
+                val packets = root.optJSONArray("packets") ?: return
+
+                var lastD: PeriK3JsonFrame? = null
+                for (i in 0 until packets.length()) {
+                    val p = packets.optString(i, "").trim()
+                    if (!p.startsWith("{")) continue
+
+                    val frame = PeriK3JsonFrame.parseOrNull(p, receivedAtMs) ?: continue
+                    if (frame.t == "D") lastD = frame
                 }
-            } else {
-                candidates.add(trimmed0)
+
+                if (lastD != null) {
+                    latestDFrame = lastD
+                    latestSeq = receivedAtMs  // ✅ 중요: seq 갱신
+                }
+                return
+            }
+
+            // 2) (추가) RAW 단일 프레임 지원: {"t":"D", ...}
+            val t = root.optString("t", "")
+            if (t.isNotEmpty()) {
+                val frame = PeriK3JsonFrame.parseOrNull(root.toString(), receivedAtMs) ?: return
+                if (frame.t == "D") {
+                    latestDFrame = frame
+                    latestSeq = receivedAtMs  // ✅ 중요: seq 갱신
+                }
             }
         } catch (_: Exception) {
-            // RAW가 JSONObject로 깨지면 그냥 raw 자체를 후보로
-            candidates.add(trimmed0)
+            // JSON 파싱 실패는 무시 (펌웨어 깨진 데이터/중간 조각 등)
         }
-
-        var lastD: PeriK3JsonFrame? = null
-        for (c in candidates) {
-            val normalized = normalizeMaybeEscapedJson(c) ?: continue
-            val frame = PeriK3JsonFrame.parseOrNull(normalized, receivedAtMs) ?: continue
-            if (frame.t == "D") lastD = frame
-        }
-
-        if (lastD != null) {
-            latestDFrame = lastD
-            latestSeq++              // ✅ 이게 없으면 200ms 루프에서 적용이 안 됨
-        }
-    }
-
-    /** "{\"t\":\"D\"...}" 처럼 escape된 JSON이면 1회 unescape 해서 정상 JSON으로 만든다 */
-    private fun normalizeMaybeEscapedJson(s: String): String? {
-        var t = s.trim()
-
-        // 양끝이 따옴표로 감싸진 형태까지 오는 경우 방어
-        if (t.length >= 2 && t.first() == '"' && t.last() == '"') {
-            t = t.substring(1, t.length - 1)
-        }
-
-        // \" 패턴이 보이면 unescape 1회
-        if (t.contains("\\\"")) {
-            t = t
-                .replace("\\\\", "\\")
-                .replace("\\\"", "\"")
-                .replace("\\r", "\r")
-                .replace("\\n", "\n")
-        }
-
-        if (!t.startsWith("{") || !t.endsWith("}")) return null
-        return t
     }
     private fun applyFrame(frame: PeriK3JsonFrame) {
         val tab = _selectedTab.value ?: 0
-        android.util.Log.d("PeriK3_UI", "APPLY tab=$tab ts=${frame.ts} F=${frame.F} LD=${frame.LD}")
 
-        // ===== 1) 헤더 UI용 값 계산 =====
+        // ✅ 공통: receivedAt/ts가 없으면 스킵
+        if (frame.ts == null) return
+
+        // ✅ 탭별 필수 값 없으면 스킵 (그래프/표/애니메이터 안전)
         when (tab) {
-            0 -> { // T1: IDLE/STABLE/TREMOR 만 3칸
-                val state012 = when (frame.s ?: 0) {
-                    0 -> 0 // IDLE
-                    1 -> 1 // STABLE
-                    2 -> 2 // TREMOR
-                    else -> 1 // PRESS류는 일단 STABLE로 처리
-                }
-                _t1IndicatorState.postValue(state012)
+            0, 1 -> {
+                // Force 기반 그래프/표
+                val f = frame.F
+                val x = frame.x
+                val r = frame.r
+                if (f == null || x == null || r == null) return
+                if (!f.isFinite() || !x.isFinite() || !r.isFinite()) return
             }
+            2 -> {
+                // LD 기반 그래프 + px/py 방향 표시(쓸 경우)
+                val ld = frame.LD
+                if (ld == null || !ld.isFinite()) return
 
-            1 -> { // T2: 6셀 fill = Force 기반 0..1
-                val f = frame.F ?: 0.0
-                val frac = (f / t2ForceMaxN).toFloat().coerceIn(0f, 1f)
-                _t2FillFraction.postValue(frac)
-            }
-
-            2 -> { // T3: bipolar = LD 기반 -1..1
-                val ld = frame.LD ?: 0.0
-                val v = (ld / t3LdAbsMax).toFloat().coerceIn(-1f, 1f)
-                _t3BipolarValue.postValue(v)
+                // px/py를 UI에 쓰는 경우만 체크
+                val px = frame.px
+                val py = frame.py
+                if (px != null && !px.isFinite()) return
+                if (py != null && !py.isFinite()) return
             }
         }
 
@@ -192,7 +169,8 @@ class MeasurementViewModel : ViewModel() {
     }
 
     private fun appendLogRowAndMaybeEvent(frame: PeriK3JsonFrame, tab: Int) {
-        val ts = (frame.ts ?: 0L).toString()
+        val rawTs = frame.ts ?: return
+        val ts = formatElapsedTs(rawTs)
 
         val normalRow = if (tab == 2) {
             // T3: timestamp, x,y,z,rotation (ts, px, py, LV, r)
@@ -234,21 +212,18 @@ class MeasurementViewModel : ViewModel() {
     }
 
     private fun appendChart(frame: PeriK3JsonFrame, tab: Int) {
-        val y = if (tab == 2) {
-            (frame.LD ?: 0.0).toFloat()
-        } else {
-            (frame.F ?: 0.0).toFloat()
-        }
+        val y = if (tab == 2) frame.LD?.toFloat() else frame.F?.toFloat()
+        if (y == null || y.isNaN() || y.isInfinite()) return
 
         val x = if (useReceivedTimeForChartX) {
-            val recv = frame.receivedAtMs ?: System.currentTimeMillis()
+            val recv = frame.receivedAtMs ?: return
             if (firstReceivedAtMs < 0L) firstReceivedAtMs = recv
-            ((recv - firstReceivedAtMs).toFloat() / 1000f) // 0부터 시작하는 seconds
+            ((recv - firstReceivedAtMs).toFloat() / 1000f)
         } else {
-            ((frame.ts ?: 0L).toFloat() / 1000f)
+            ((frame.ts ?: return).toFloat() / 1000f)
         }
+        if (x.isNaN() || x.isInfinite()) return
 
-        // ✅ X가 뒤로 가면 차트가 터질 수 있음 → 안전장치로 단조 증가 보정
         val lastX = chartBuffer.lastOrNull()?.x
         val safeX = if (lastX != null && x <= lastX) lastX + 0.001f else x
 
@@ -287,6 +262,7 @@ class MeasurementViewModel : ViewModel() {
         logBuffer.clear()
         chartBuffer.clear()
         firstReceivedAtMs = -1L
+        firstDeviceTs = -1L
 
         _logRows.postValue(emptyList())
         _chartEntries.postValue(emptyList())
@@ -302,5 +278,16 @@ class MeasurementViewModel : ViewModel() {
     private fun fmt(v: Double?): String {
         if (v == null) return "?"
         return String.format("%.2f", v)
+    }
+
+    private fun formatElapsedTs(ts: Long): String {
+        if (firstDeviceTs < 0L) firstDeviceTs = ts
+        val delta = (ts - firstDeviceTs).coerceAtLeast(0L)
+
+        val minutes = delta / 60_000
+        val seconds = (delta % 60_000) / 1_000
+        val millis  = delta % 1_000
+
+        return String.format("%02d:%02d.%03d", minutes, seconds, millis)
     }
 }
