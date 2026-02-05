@@ -16,7 +16,8 @@ data class PeriK3JsonFrame(
     val px: Double? = null,
     val py: Double? = null,
     val r: Double? = null,
-    val receivedAtMs: Long = 0L
+    val receivedAtMs: Long = 0L,
+    val rawJson: String,
 ) {
     fun stateLabel(): String = when (s ?: -1) {
         0 -> "IDLE"
@@ -28,12 +29,6 @@ data class PeriK3JsonFrame(
         else -> "UNKNOWN"
     }
 
-    fun isEvent(): Boolean {
-        val pxV = px ?: 0.0
-        val pyV = py ?: 0.0
-        val ldV = LD ?: 0.0
-        return abs(pxV) > 1e-6 || abs(pyV) > 1e-6 || abs(ldV) > 1e-6
-    }
 
     companion object {
         fun parseOrNull(raw: String, receivedAtMs: Long): PeriK3JsonFrame? {
@@ -58,7 +53,8 @@ data class PeriK3JsonFrame(
                     px = if (o.has("px")) o.optDouble("px") else null,
                     py = if (o.has("py")) o.optDouble("py") else null,
                     r = if (o.has("r")) o.optDouble("r") else null,
-                    receivedAtMs = receivedAtMs
+                    receivedAtMs = receivedAtMs,
+                    rawJson = trimmed
                 )
             } catch (_: Exception) {
                 null
