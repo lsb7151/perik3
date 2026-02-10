@@ -11,6 +11,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -20,10 +21,16 @@ class MeasurementViewModel : ViewModel() {
     private val _selectedTab = MutableLiveData(0)
     val selectedTab: LiveData<Int> = _selectedTab
 
+    /**
+     * ✅ 탭 변경 시: 리셋 없음
+     * - 단지 "요약 텍스트(summary)"만 현재 탭 기준으로 다시 보여주기
+     * - 로그/그래프는 탭별로 다르게 쌓는 구조라면 여기서 clearBuffersForTabChange()를 유지하면 되지만,
+     *   너 요구사항은 "탭변경 리셋 안 됨"이라서 호출 제거.
+     */
     fun setSelectedTab(index: Int) {
         if (_selectedTab.value == index) return
         _selectedTab.value = index
-        clearBuffersForTabChange()
+        updateSummaryText()
     }
 
     // ====== 좌측 헤더용 값들 ======
@@ -33,9 +40,19 @@ class MeasurementViewModel : ViewModel() {
     private val _t2FillFraction = MutableLiveData(0f)  // 0..1
     val t2FillFraction: LiveData<Float> = _t2FillFraction
 
-    private val _t3BipolarValue = MutableLiveData(0f)  // -1..1
+    private val _t3BipolarValue = MutableLiveData(0f)  // -1..1 (LD)
     val t3BipolarValue: LiveData<Float> = _t3BipolarValue
+
+    // T3 LV 하단 텍스트 (예: "3.1 mm/s")
+    private val _t3LvText = MutableLiveData("")
+    val t3LvText: LiveData<String> = _t3LvText
+
+    // ====== ✅ 하단 요약(TextView 한 개로 T2/T3 다르게) ======
+    private val _summaryText = MutableLiveData("")
+    val summaryText: LiveData<String> = _summaryText
+
     private var firstDeviceTs: Long = -1L
+
     // ====== 우측 로그(표) ======
     private val _logRows = MutableLiveData<List<MeasurementLogRow>>(emptyList())
     val logRows: LiveData<List<MeasurementLogRow>> = _logRows
@@ -50,6 +67,7 @@ class MeasurementViewModel : ViewModel() {
     private val _chartYMax = MutableLiveData<Float?>(null)
     val chartYMax: LiveData<Float?> = _chartYMax
 
+    // ====== 오버레이 ======
     data class OverlayPoint(val x: Float, val y: Float)
     data class DirectionVec(val dx: Float, val dy: Float)
 
@@ -62,28 +80,37 @@ class MeasurementViewModel : ViewModel() {
     private val _t3DirectionVec = MutableLiveData<DirectionVec?>()
     val t3DirectionVec: LiveData<DirectionVec?> = _t3DirectionVec
 
+    // ====== 마지막 확정 상태 ======
     private var lastT2Index: Int = -1
     private var lastT3Index: Int = -1
-
-    private var lastT2Point: OverlayPoint? = null
-    private var lastT3Point: OverlayPoint? = null
-
-    private var lastT3Dir: DirectionVec? = null
 
     private var lastT1State: Int = 0
     private var lastT2Frac: Float = 0f
     private var lastT3Value: Float = 0f
 
-    // T2: 5좌표 (Top / Left / Center / Right / Bottom)
+    // ====== ✅ 튐 방지: "연속 N프레임" 안정화 (hold) ======
+    private var t2CandidateIdx: Int = -1
+    private var t2CandidateCount: Int = 0
+    private val t2StableCountNeeded = 3
+
+    private var t3CandidateIdx: Int = -1
+    private var t3CandidateCount: Int = 0
+    private val t3StableCountNeeded = 3
+
+    // ====== ✅ 튐 방지: TOP 판정 히스테리시스 ======
+    private var t2IsTopLatched: Boolean = false
+    private var t3IsTopLatched: Boolean = false
+
+    // T2: 5좌표 (Top / Left / Right / Bottom-Left / Bottom-Right)
     private val t2Points = listOf(
         OverlayPoint(0.50f, 0.30f), // TOP
-        OverlayPoint(0.40f, 0.48f), // LEFT ( -,- )
-        OverlayPoint(0.60f, 0.48f), // RIGHT ( +,- )
-        OverlayPoint(0.30f, 0.72f), // BOTTOM-LEFT ( -,+ )
-        OverlayPoint(0.70f, 0.72f) // BOTTOM-RIGHT ( +,+ )
+        OverlayPoint(0.40f, 0.48f), // LEFT
+        OverlayPoint(0.60f, 0.48f), // RIGHT
+        OverlayPoint(0.30f, 0.72f), // BOTTOM-LEFT
+        OverlayPoint(0.70f, 0.72f)  // BOTTOM-RIGHT
     )
 
-    // T3: "위에서부터 3좌표만"
+    // T3: 위 3좌표만
     private val t3Top3Points = listOf(
         OverlayPoint(0.50f, 0.40f), // TOP
         OverlayPoint(0.40f, 0.48f), // LEFT
@@ -91,8 +118,7 @@ class MeasurementViewModel : ViewModel() {
     )
 
     // ====== 내부 버퍼 ======
-    @Volatile
-    var latestDFrame: PeriK3JsonFrame? = null
+    @Volatile var latestDFrame: PeriK3JsonFrame? = null
     @Volatile private var latestSeq: Long = 0L
     private var lastAppliedSeq: Long = 0L
 
@@ -102,38 +128,53 @@ class MeasurementViewModel : ViewModel() {
     private val chartBuffer: ArrayDeque<Entry> = ArrayDeque()
     private val maxChartPoints = 3000
 
-    // T2: Force 정규화 기준 (필요하면 튜닝)
+    // T2: Force 정규화 기준
     private val t2ForceMaxN = 12.0
 
-    // T3: LD bipolar 정규화 기준 (필요하면 튜닝)
-    private val t3LvAbsMax = 5.0
+    // T3: LD bipolar 정규화 기준
+    private val t3LdAbsMax = 5.0
 
-    //  그래프 X축: 장비 ts 대신 "수신 시간"을 기본으로 사용 (단조 증가 보장)
-    //   - 장비 ts를 꼭 쓰고 싶으면 false로 바꿔도 되는데, ts가 리셋되면 그래프가 깨질 수 있음
+    // 그래프 X축: 수신 시간 사용(단조 증가)
     private val useReceivedTimeForChartX: Boolean = true
     private var firstReceivedAtMs: Long = -1L
 
+    // ====== T3 Peak (누적) + Rotation Presence ======
+    private var peakPy: Double = Double.NEGATIVE_INFINITY
+    private var peakLv: Double = Double.NEGATIVE_INFINITY
+    private var lastRotationPositive: Boolean = false
+
+    // ====== T2 P 프레임 저장 ======
+    data class PFrame(
+        val e: Double?,      // Elastic Energy (J)
+        val fmax: Double?,   // Peak Response Slope (N/mm)
+        val xmax: Double?,   // Maximum Disp (mm)
+        val r2: Double?,     // Curve Fit Quality (R^2)
+        val dur: Long?       // optional
+    )
+    @Volatile private var latestPFrame: PFrame? = null
+
     init {
-        //  200ms 샘플링 루프 (UI/로그/그래프도 200ms에 한 번만 갱신)
+        // 200ms 샘플링 루프 (D 프레임 적용)
         viewModelScope.launch {
             while (true) {
                 val seq = latestSeq
                 if (seq != 0L && seq != lastAppliedSeq) {
-                    val frame = latestDFrame
-                    if (frame != null) {
-                        applyFrame(frame)
+                    latestDFrame?.let { frame ->
+                        applyDFrame(frame)
                         lastAppliedSeq = seq
                     }
                 }
                 delay(200L)
             }
         }
+
+        // ✅ 최초 기본 위치를 "최상단 중앙"으로 한번 찍어줌
+        //    (원하면 Fragment에서 setMarkerVisible(false)로 숨기고 시작해도 됨)
+        _t2OverlayPoint.postValue(t2Points[0])
+        _t3OverlayPoint.postValue(t3Top3Points[0])
+        _t3DirectionVec.postValue(null)
     }
 
-    /**
-     * Fragment에서 "수신된 JSON 문자열"을 넣어줌
-     * - receivedAtMs: System.currentTimeMillis() 로 넣어줘
-     */
     fun onRawPacketReceived(raw: String, receivedAtMs: Long) {
         val text = raw.trim()
         if (text.isEmpty()) return
@@ -141,72 +182,217 @@ class MeasurementViewModel : ViewModel() {
         try {
             val root = JSONObject(text)
 
-            // 1) (기존) BLE_RX 배치 포맷 지원
+            // BLE_RX 배치 포맷
             if (root.optString("type", "") == "BLE_RX") {
                 val packets = root.optJSONArray("packets") ?: return
-
                 var lastD: PeriK3JsonFrame? = null
+
                 for (i in 0 until packets.length()) {
                     val p = packets.optString(i, "").trim()
                     if (!p.startsWith("{")) continue
 
                     val frame = PeriK3JsonFrame.parseOrNull(p, receivedAtMs) ?: continue
                     if (frame.t == "D") lastD = frame
+                    if (frame.t == "P") {
+                        parsePFrame(JSONObject(p))?.let { applyPFrame(it) }
+                    }
                 }
 
                 if (lastD != null) {
                     latestDFrame = lastD
-                    latestSeq = receivedAtMs  // ✅ 중요: seq 갱신
+                    latestSeq = receivedAtMs
                 }
                 return
             }
 
-            // 2) (추가) RAW 단일 프레임 지원: {"t":"D", ...}
+            // RAW 단일 프레임: {"t":"D"} / {"t":"P"}
             val t = root.optString("t", "")
-            if (t.isNotEmpty()) {
-                val frame = PeriK3JsonFrame.parseOrNull(root.toString(), receivedAtMs) ?: return
-                if (frame.t == "D") {
+            when (t) {
+                "D" -> {
+                    val frame = PeriK3JsonFrame.parseOrNull(root.toString(), receivedAtMs) ?: return
                     latestDFrame = frame
-                    latestSeq = receivedAtMs  // 중요: seq 갱신
+                    latestSeq = receivedAtMs
+                }
+                "P" -> {
+                    parsePFrame(root)?.let { applyPFrame(it) }
                 }
             }
         } catch (_: Exception) {
-            // JSON 파싱 실패는 무시 (펌웨어 깨진 데이터/중간 조각 등)
+            // ignore
         }
     }
-    private fun applyFrame(frame: PeriK3JsonFrame) {
-        val tab = _selectedTab.value ?: 0
 
-        //  공통: ts 없으면 스킵 (너 요구사항 그대로)
-        val ts = frame.ts ?: return
+    // =========================
+    // ✅ Save Result 시 "전체 리셋"
+    // =========================
+    fun resetAllAfterSaveResult() {
+        // 버퍼/표/그래프
+        logBuffer.clear()
+        chartBuffer.clear()
+        firstReceivedAtMs = -1L
+        firstDeviceTs = -1L
 
-        // =========================================================
-        // 1) 헤더 UI 값들은 "탭과 무관하게 항상" 최신값으로 갱신
-        //    단, update 함수 내부에서 "유효할 때만 post" 하도록!
-        // =========================================================
-        updateT1Indicator(frame)   // TF=1 처리 포함 (빈값 무시)
-        updateT2SixCell(frame)     // F 기반 (null/NaN 무시)
-        updateT3Bipolar(frame)     // LD 기반 (null/NaN 무시)
+        _logRows.postValue(emptyList())
+        _chartEntries.postValue(emptyList())
+        _chartYMin.postValue(null)
+        _chartYMax.postValue(null)
 
-        // Overlay도 "항상 계산"은 OK.
-        // 다만 updateOverlay 내부에서 null/무효면 "아무것도 post하지 않음" (마지막 유지)
+        // 헤더 값(원하면 초기화)
+        _t1IndicatorState.postValue(0)
+        _t2FillFraction.postValue(0f)
+        _t3BipolarValue.postValue(0f)
+        _t3LvText.postValue("")
+
+        // T3 peak + rotation
+        peakPy = Double.NEGATIVE_INFINITY
+        peakLv = Double.NEGATIVE_INFINITY
+        lastRotationPositive = false
+
+        // T2 P 프레임
+        latestPFrame = null
+
+        // 오버레이 안정화 상태도 리셋
+        lastT2Index = -1
+        lastT3Index = -1
+        t2CandidateIdx = -1
+        t2CandidateCount = 0
+        t3CandidateIdx = -1
+        t3CandidateCount = 0
+        t2IsTopLatched = false
+        t3IsTopLatched = false
+
+        // ✅ 기본 위치: 최상단 중앙으로
+        _t2OverlayPoint.postValue(t2Points[0])
+        _t3OverlayPoint.postValue(t3Top3Points[0])
+        _t3DirectionVec.postValue(null)
+
+        // 요약 텍스트도 비움 (현재 탭이 T2/T3여도 비어짐)
+        _summaryText.postValue("")
+    }
+
+    // =========================
+    // D 프레임 적용
+    // =========================
+    private fun applyDFrame(frame: PeriK3JsonFrame) {
+        // ts 없으면 스킵
+        frame.ts ?: return
+
+        // 헤더 갱신
+        updateT1Indicator(frame)
+        updateT2SixCell(frame)
+        updateT3Bipolar(frame)
+        updateT3LvText(frame)
+
+        // 오버레이(튐 방지 포함)
         updateOverlayT2(frame)
         updateOverlayT3(frame)
 
-        // =========================================================
-        // 2) 로그/그래프는 "현재 탭" 기준으로만 쌓기
-        //    (이 부분에서도 무효면 스킵하는 guard는 append 내부에서 처리 권장)
-        // =========================================================
-        appendLogRow(frame, tab)   //  EVENT 제거했으면 여기서 절대 추가하지 않게
+        // 로그/그래프: "현재 탭 기준"
+        val tab = _selectedTab.value ?: 0
+        appendLogRow(frame, tab)
         appendChart(frame, tab)
+
+        // ✅ T3 요약 값은 "T3 탭일 때만 누적" (혼입 방지)
+        if (tab == 2) {
+            updateT3PeaksAndRotation(frame)
+            updateSummaryText()
+        }
     }
 
+    // =========================
+    // P 프레임 적용 (즉시 반영)
+    // =========================
+    private fun parsePFrame(root: JSONObject): PFrame? {
+        if (root.optString("t", "") != "P") return null
+
+        fun optDoubleOrNull(key: String): Double? =
+            if (root.has(key)) root.optDouble(key, Double.NaN).takeIf { it.isFinite() } else null
+
+        fun optLongOrNull(key: String): Long? =
+            if (root.has(key)) root.optLong(key, Long.MIN_VALUE).takeIf { it != Long.MIN_VALUE } else null
+
+        return PFrame(
+            e = optDoubleOrNull("e"),
+            fmax = optDoubleOrNull("fmax"),
+            xmax = optDoubleOrNull("xmax"),
+            r2 = optDoubleOrNull("r2"),
+            dur = optLongOrNull("dur")
+        )
+    }
+
+    private fun applyPFrame(p: PFrame) {
+        latestPFrame = p
+        // 탭이 T2일 때는 즉시 보이게
+        if ((_selectedTab.value ?: 0) == 1) {
+            updateSummaryText()
+        }
+    }
+
+    // =========================
+    // 요약 텍스트 (T1 숨김 / T2 P / T3 Peak)
+    // =========================
+    private fun updateSummaryText() {
+        when (_selectedTab.value ?: 0) {
+            0 -> _summaryText.postValue("") // T1 숨김
+
+            1 -> { // T2
+                val p = latestPFrame
+                if (p == null) {
+                    _summaryText.postValue("")
+                    return
+                }
+
+                val s = listOf(
+                    "Peak Response Slope : ${p.fmax?.let { "%.2f".format(it) } ?: "-"} N/mm",
+                    "Elastic Energy : ${p.e?.let { "%.6f".format(it) } ?: "-"} J",
+                    "Curve Fit Quality : R² = ${p.r2?.let { "%.3f".format(it) } ?: "-"}",
+                    "Maximum Disp : ${p.xmax?.let { "%.3f".format(it) } ?: "-"} mm"
+                ).joinToString("\n")
+
+                _summaryText.postValue(s)
+            }
+
+            2 -> { // T3
+                if (!peakPy.isFinite() && !peakLv.isFinite()) {
+                    _summaryText.postValue("")
+                    return
+                }
+
+                val lift = if (peakPy.isFinite()) "%.2f".format(peakPy) else "-"
+                val vel = if (peakLv.isFinite()) "%.2f".format(peakLv) else "-"
+                val presence = if (lastRotationPositive) "Present" else "Absent"
+
+                val s = listOf(
+                    "Peak lift : $lift mm",
+                    "Peak movement velocity : $vel mm/s",
+                    "Rotation Presence : $presence"
+                ).joinToString("\n")
+
+                _summaryText.postValue(s)
+            }
+        }
+    }
+
+    private fun updateT3PeaksAndRotation(frame: PeriK3JsonFrame) {
+        frame.py?.let { py ->
+            if (py.isFinite()) peakPy = max(peakPy, py)
+        }
+        frame.LV?.let { lv ->
+            if (lv.isFinite()) peakLv = max(peakLv, lv)
+        }
+        frame.r?.let { r ->
+            lastRotationPositive = r > 0.0
+        }
+    }
+
+    // =========================
+    // 로그/그래프
+    // =========================
     private fun appendLogRow(frame: PeriK3JsonFrame, tab: Int) {
         val rawTs = frame.ts ?: return
         val ts = formatElapsedTs(rawTs)
 
-        val normalRow = if (tab == 2) {
-            // T3: timestamp, x,y,z,rotation (ts, px, py, LV, r)
+        val row = if (tab == 2) {
             MeasurementLogRow(
                 c1 = ts,
                 c2 = fmt(frame.px),
@@ -215,7 +401,6 @@ class MeasurementViewModel : ViewModel() {
                 c5 = fmt(frame.r)
             )
         } else {
-            // T1/T2: timestamp, state, force, disp, rotation (ts, s, F, x, r)
             MeasurementLogRow(
                 c1 = ts,
                 c2 = frame.stateLabel(),
@@ -225,15 +410,14 @@ class MeasurementViewModel : ViewModel() {
             )
         }
 
-        // 최신이 위로 오게 addFirst
-        logBuffer.addFirst(normalRow)
-
+        logBuffer.addFirst(row)
         while (logBuffer.size > maxLogSize) logBuffer.removeLast()
         _logRows.postValue(logBuffer.toList())
     }
 
+    //  그래프: T2=Force(F), T3=ventral displacement(py)
     private fun appendChart(frame: PeriK3JsonFrame, tab: Int) {
-        val y = if (tab == 2) frame.LD?.toFloat() else frame.F?.toFloat()
+        val y = if (tab == 2) frame.py?.toFloat() else frame.F?.toFloat()
         if (y == null || y.isNaN() || y.isInfinite()) return
 
         val x = if (useReceivedTimeForChartX) {
@@ -254,7 +438,6 @@ class MeasurementViewModel : ViewModel() {
         val list = chartBuffer.toList()
         _chartEntries.postValue(list)
 
-        //  T3: 음수 포함 → 0이 중간쯤 오도록 min/max 잡기
         if (tab == 2 && list.isNotEmpty()) {
             var minY = Float.POSITIVE_INFINITY
             var maxY = Float.NEGATIVE_INFINITY
@@ -262,38 +445,17 @@ class MeasurementViewModel : ViewModel() {
                 minY = min(minY, e.y)
                 maxY = max(maxY, e.y)
             }
-
-            // 0 포함
             minY = min(minY, 0f)
             maxY = max(maxY, 0f)
 
             val range = max(1e-6f, maxY - minY)
             val pad = range * 0.25f
-
             _chartYMin.postValue(minY - pad)
             _chartYMax.postValue(maxY + pad)
         } else {
             _chartYMin.postValue(null)
             _chartYMax.postValue(null)
         }
-    }
-
-    private fun clearBuffersForTabChange() {
-        // 탭 바뀌면 버퍼 초기화(안 하면 축/의미 섞임)
-        logBuffer.clear()
-        chartBuffer.clear()
-        firstReceivedAtMs = -1L
-        firstDeviceTs = -1L
-
-        _logRows.postValue(emptyList())
-        _chartEntries.postValue(emptyList())
-        _chartYMin.postValue(null)
-        _chartYMax.postValue(null)
-
-        // 헤더 값도 초기화(원하면 유지해도 됨)
-        _t1IndicatorState.postValue(0)
-        _t2FillFraction.postValue(0f)
-        _t3BipolarValue.postValue(0f)
     }
 
     private fun fmt(v: Double?): String {
@@ -307,47 +469,107 @@ class MeasurementViewModel : ViewModel() {
 
         val minutes = delta / 60_000
         val seconds = (delta % 60_000) / 1_000
-        val millis  = delta % 1_000
+        val millis = delta % 1_000
 
         return String.format("%02d:%02d.%03d", minutes, seconds, millis)
     }
 
+    // =========================
+    // 오버레이 튐 방지
+    // =========================
+    private fun decideT2IsTop(px: Double, py: Double, ld: Double): Boolean {
+        fun isPos(v: Double) = v > 0.0
+        fun isNegOrZero(v: Double) = v <= 0.0
+
+        // px 보정 범위 (-0.5 ~ 0.5 근처를 TOP으로)
+        val enterPx = 0.50
+        val exitPx = 0.70
+
+        val baseOk = isNegOrZero(py) && isPos(ld)
+        if (!baseOk) {
+            t2IsTopLatched = false
+            return false
+        }
+
+        val pxAbs = kotlin.math.abs(px)
+        t2IsTopLatched =
+            if (t2IsTopLatched) pxAbs <= exitPx
+            else pxAbs <= enterPx
+
+        return t2IsTopLatched
+    }
+
+    private fun decideT3IsTop(px: Double, py: Double, ld: Double): Boolean {
+        fun isPos(v: Double) = v > 0.0
+        fun isNegOrZero(v: Double) = v <= 0.0
+
+        val enterPx = 0.45
+        val exitPx = 0.60
+
+        val baseOk = isNegOrZero(py) && isPos(ld)
+        if (!baseOk) {
+            t3IsTopLatched = false
+            return false
+        }
+
+        val pxAbs = kotlin.math.abs(px)
+        t3IsTopLatched =
+            if (t3IsTopLatched) pxAbs <= exitPx
+            else pxAbs <= enterPx
+
+        return t3IsTopLatched
+    }
 
     private fun updateOverlayT2(frame: PeriK3JsonFrame) {
         val px = frame.px ?: return
         val py = frame.py ?: return
-        val ld = frame.LD ?: return   // z = LD
+        val ld = frame.LD ?: return
 
-        // 부호 규칙: '-'는 0이하, '+'는 0보다 큼
-        fun isPos(v: Double) = v > 0.0
-        fun isNegOrZero(v: Double) = v < 0.0
+        val eps = 1e-6
+        val isZeroTriple =
+            kotlin.math.abs(px) <= eps &&
+                    kotlin.math.abs(py) <= eps &&
+                    kotlin.math.abs(ld) <= eps
 
-        //  TOP 조건: x가 -1~+1, y는 '-', z는 '+'
-        //   (x 범위는 스펙 그대로 1.0 사용)
-        val isTop = (kotlin.math.abs(px) <= 1.0) && isNegOrZero(py) && isPos(ld)
+        val idx = when {
+            //  0,0,0 → 최상단 중앙
+            isZeroTriple -> 0
 
-        val idx = if (isTop) {
-            0 // TOP
-        } else {
-            // 나머지는 z가 '-'(0이하)일 때만 유효하게 찍는다.
-            // z가 '+'인데 TOP 조건을 못 맞춘 경우(예: x가 너무 큼)는 "유지" 처리
-          //   if (isPos(ld)) return
+            //  TOP 판정
+            decideT2IsTop(px, py, ld) -> 0
 
-            when {
-                isNegOrZero(px) && isNegOrZero(py) -> 1 // (-, -, -)
-                isPos(px)       && isNegOrZero(py) -> 2 // (+, -, -)
-                isNegOrZero(px) && isPos(py)        -> 3 // (-, +, -)
-                else                               -> 4 // (+, +, -)
-            }
+            //  TOP이 아닐 때: py 기준으로 하단 / 최하단 분리
+            py <= 0.0 && px <= 0.0 -> 1   // 하단 왼쪽
+            py <= 0.0 && px > 0.0  -> 2   // 하단 오른쪽
+            py > 0.0  && px <= 0.0 -> 3   // 최하단 왼쪽
+            else                   -> 4  // 최하단 오른쪽
         }
 
-        //  같은 위치면 업데이트 생략(깜빡임 방지)
+        //  0,0,0은 즉시 반영
+        if (isZeroTriple) {
+            t2CandidateIdx = idx
+            t2CandidateCount = t2StableCountNeeded
+            if (idx != lastT2Index) {
+                lastT2Index = idx
+                _t2OverlayPoint.postValue(t2Points[idx])
+            }
+            return
+        }
+
+        //  hold 로직
+        if (idx != t2CandidateIdx) {
+            t2CandidateIdx = idx
+            t2CandidateCount = 1
+            return
+        } else {
+            t2CandidateCount++
+        }
+
+        if (t2CandidateCount < t2StableCountNeeded) return
         if (idx == lastT2Index) return
 
         lastT2Index = idx
-        val p = t2Points[idx]
-        lastT2Point = p
-        _t2OverlayPoint.postValue(p)
+        _t2OverlayPoint.postValue(t2Points[idx])
     }
 
     private fun updateOverlayT3(frame: PeriK3JsonFrame) {
@@ -355,52 +577,70 @@ class MeasurementViewModel : ViewModel() {
         val py = frame.py ?: return
         val ld = frame.LD ?: return
 
-        fun isPos(v: Double) = v > 0.0
-        fun isNegOrZero(v: Double) = v <= 0.0
+        val eps = 1e-6
+        val isZeroTriple =
+            kotlin.math.abs(px) <= eps &&
+                    kotlin.math.abs(py) <= eps &&
+                    kotlin.math.abs(ld) <= eps
 
-        val isTop = (kotlin.math.abs(px) <= 0.5) && isNegOrZero(py) && isPos(ld)
+        val idx = when {
+            //  0,0,0 → 최상단 중앙
+            isZeroTriple -> 0
 
-        val idx = if (isTop) {
-            0 // TOP
+            //  TOP
+            decideT3IsTop(px, py, ld) -> 0
+
+            //  TOP 아님 → px 부호만 사용
+            px <= 0.0 -> 1   // 왼쪽 하단
+            else      -> 2   // 오른쪽 하단
+        }
+
+        if (isZeroTriple) {
+            t3CandidateIdx = idx
+            t3CandidateCount = t3StableCountNeeded
+            if (idx != lastT3Index) {
+                lastT3Index = idx
+                _t3OverlayPoint.postValue(t3Top3Points[idx])
+            }
+            _t3DirectionVec.postValue(null)
+            return
+        }
+
+        if (idx != t3CandidateIdx) {
+            t3CandidateIdx = idx
+            t3CandidateCount = 1
+            frame.r?.let { updateDirectionByR(it) }
+            return
         } else {
-       //     if (isPos(ld)) return         // TOP 아닌데 z가 +면 유지
-        //    if (!isPos(py)) return        // 아래 라인(y=+)만 사용
-            if (isNegOrZero(px)) 1 else 2 // LEFT/RIGHT
+            t3CandidateCount++
         }
 
-        //  위치는 유지/업데이트
-        if (idx != lastT3Index) {
+        if (t3CandidateCount >= t3StableCountNeeded && idx != lastT3Index) {
             lastT3Index = idx
-            val p = t3Top3Points[idx]
-            lastT3Point = p
-            _t3OverlayPoint.postValue(p)
+            _t3OverlayPoint.postValue(t3Top3Points[idx])
         }
 
-        // 화살표는 r 들어오면 갱신 (null이면 유지)
         frame.r?.let { updateDirectionByR(it) }
     }
 
     private fun updateDirectionByR(rDeg: Double) {
         val rad = Math.toRadians(rDeg)
-
-        //  0° = 12시(위), 90° = 3시(오른쪽), 180° = 6시(아래), -90° = 9시(왼쪽)
         val dx = kotlin.math.sin(rad).toFloat()
         val dy = (-kotlin.math.cos(rad)).toFloat()
-
-        val v = DirectionVec(dx, dy)
-
-        lastT3Dir = v
-        _t3DirectionVec.postValue(v)
+        _t3DirectionVec.postValue(DirectionVec(dx, dy))
     }
 
+    // =========================
+    // 헤더 값 업데이트
+    // =========================
     private fun updateT1Indicator(frame: PeriK3JsonFrame) {
         val tf = frame.TF
         val s = frame.s
 
         val newState = when {
-            tf == 1 -> 2 // TREMOR 강제
-            s == null -> return              //  빈값 → 무시
-            s !in 0..2 -> return             //  범위 밖 → 무시
+            tf == 1 -> 2
+            s == null -> return
+            s !in 0..2 -> return
             else -> s
         }
 
@@ -411,13 +651,10 @@ class MeasurementViewModel : ViewModel() {
     }
 
     private fun updateT2SixCell(frame: PeriK3JsonFrame) {
-        val f = frame.F ?: return           //  null 무시
-        if (!f.isFinite()) return           //  NaN/Inf 무시
+        val f = frame.F ?: return
+        if (!f.isFinite()) return
 
-        val frac = (f / t2ForceMaxN)
-            .toFloat()
-            .coerceIn(0f, 1f)
-
+        val frac = (f / t2ForceMaxN).toFloat().coerceIn(0f, 1f)
         if (frac != lastT2Frac) {
             lastT2Frac = frac
             _t2FillFraction.postValue(frac)
@@ -425,31 +662,30 @@ class MeasurementViewModel : ViewModel() {
     }
 
     private fun updateT3Bipolar(frame: PeriK3JsonFrame) {
-        val lv = frame.LV ?: return
-        if (!lv.isFinite()) return
+        val ld = frame.LD ?: return
+        if (!ld.isFinite()) return
 
-        val v = (lv / t3LvAbsMax)
-            .toFloat()
-            .coerceIn(-1f, 1f)
-
+        val v = (ld / t3LdAbsMax).toFloat().coerceIn(-1f, 1f)
         if (v != lastT3Value) {
             lastT3Value = v
             _t3BipolarValue.postValue(v)
         }
     }
 
+    private fun updateT3LvText(frame: PeriK3JsonFrame) {
+        val lv = frame.LV ?: return
+        if (!lv.isFinite()) return
+        _t3LvText.postValue(String.format("%.1f mm/s", lv))
+    }
 
     fun buildSnapshotJsonString(): String {
         val root = JSONObject()
-
         root.put("savedAtMs", System.currentTimeMillis())
         root.put("selectedTab", selectedTab.value ?: 0)
 
-        // 최신 프레임
         val frame = latestDFrame
-        root.put("latestFrameRaw", frame?.rawJson ?: JSONObject.NULL) //  PeriK3JsonFrame에 rawJson 필드가 없으면 아래 주석 참고
+        root.put("latestFrameRaw", frame?.rawJson ?: JSONObject.NULL)
 
-        // 로그 테이블(현재)
         val rows = JSONArray()
         for (r in logBuffer) {
             val o = JSONObject()
@@ -462,7 +698,6 @@ class MeasurementViewModel : ViewModel() {
         }
         root.put("logRows", rows)
 
-        // 그래프 (너무 크면 마지막 N개만)
         val points = JSONArray()
         val takeN = 60
         val tail = chartBuffer.takeLast(takeN)
@@ -475,5 +710,33 @@ class MeasurementViewModel : ViewModel() {
         root.put("chartTail", points)
 
         return root.toString()
+    }
+
+    // MeasurementViewModel 안에 추가
+    fun resetAllResults() {
+        // 로그/그래프 버퍼
+        logBuffer.clear()
+        chartBuffer.clear()
+        firstReceivedAtMs = -1L
+        firstDeviceTs = -1L
+
+        _logRows.postValue(emptyList())
+        _chartEntries.postValue(emptyList())
+        _chartYMin.postValue(null)
+        _chartYMax.postValue(null)
+
+        // T3 peak 리셋
+        peakPy = Double.NEGATIVE_INFINITY
+        peakLv = Double.NEGATIVE_INFINITY
+
+        // T2 P 프레임 결과 리셋
+        latestPFrame = null
+
+
+        _summaryText.postValue("")
+        // 공통 summary 텍스트(네 Fragment에서 peakVelocityText에 꽂는 영역)도 비우기용으로 쓰고 있다면
+        // (네 코드 구조상 peakVelocityText는 Fragment에서 만들어서 넣으니, LiveData 기반이면 여기서 같이 비우는 게 깔끔)
+        // 만약 summaryText를 쓰고 있다면 같이:
+        // _summaryText.postValue("")
     }
 }

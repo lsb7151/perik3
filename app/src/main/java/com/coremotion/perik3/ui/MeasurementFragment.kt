@@ -7,7 +7,6 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.os.SystemClock
 import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
@@ -39,8 +38,6 @@ class MeasurementFragment : Fragment() {
 
     private lateinit var logAdapter: MeasurementLogAdapter
 
-
-
     private val requestPermissionsLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
             val granted = result.values.all { it }
@@ -71,7 +68,9 @@ class MeasurementFragment : Fragment() {
         setupObservers()
 
         ensureBlePermissions()
+
         applyHeaderVisibility(0)
+        applySummaryVisibility(0)
 
         binding.imageViewBackgroundT2.drawable?.let { d ->
             binding.overlayMarkerDirectionViewT2.setFitCenterImageSize(d.intrinsicWidth, d.intrinsicHeight)
@@ -80,11 +79,15 @@ class MeasurementFragment : Fragment() {
         binding.imageViewBackgroundT3.drawable?.let { d ->
             binding.overlayMarkerDirectionViewT3.setFitCenterImageSize(d.intrinsicWidth, d.intrinsicHeight)
         }
+// T2 overlay 기본 위치 = TOP 포인트
+        binding.overlayMarkerDirectionViewT2.setDefaultMarkerPositionNormalized(0.5f, 0.30f)
 
-        binding.sixCellFillGraphViewT2.setUnit("N/mm")     // 예: "%" 또는 "N" 등
-        binding.sixCellBipolarGraphViewT3.setUnit("mm")  // 예: "deg" 또는 "norm" 등
-        binding.sixCellFillGraphViewT2.setLabel("F")     //
-        binding.sixCellBipolarGraphViewT3.setLabel("LD")   // 예: r(회전)
+// T3 overlay 기본 위치 = TOP 포인트
+        binding.overlayMarkerDirectionViewT3.setDefaultMarkerPositionNormalized(0.5f, 0.40f)
+        binding.sixCellFillGraphViewT2.setUnit("N/mm")
+        binding.sixCellBipolarGraphViewT3.setUnit("mm")
+        binding.sixCellFillGraphViewT2.setLabel("F")
+        binding.sixCellBipolarGraphViewT3.setLabel("LD")
     }
 
     private fun ensureBlePermissions() {
@@ -114,9 +117,8 @@ class MeasurementFragment : Fragment() {
                     val idx = tab.position
                     viewModel.setSelectedTab(idx)
                     applyHeaderVisibility(idx)
+                    applySummaryVisibility(idx)
                     applyLogHeader(idx)
-                    // (선택) 탭 변경 시 그래프/로그는 유지하고 싶으면 그대로,
-                    // 탭별로 새로 시작하고 싶으면 ViewModel에 clear() 만들어 호출하면 됨.
                 }
 
                 override fun onTabUnselected(tab: TabLayout.Tab) {}
@@ -129,6 +131,11 @@ class MeasurementFragment : Fragment() {
         binding.linearLayoutHeaderT1.visibility = if (tabIndex == 0) View.VISIBLE else View.GONE
         binding.linearLayoutHeaderT2.visibility = if (tabIndex == 1) View.VISIBLE else View.GONE
         binding.linearLayoutHeaderT3.visibility = if (tabIndex == 2) View.VISIBLE else View.GONE
+    }
+
+    private fun applySummaryVisibility(tabIndex: Int) {
+        // ✅ T1은 숨김, T2/T3만 표시 (내용은 ViewModel summaryText에서 결정)
+        binding.peakVelocityText.visibility = if (tabIndex == 0) View.GONE else View.VISIBLE
     }
 
     private fun setupLogList() {
@@ -152,14 +159,14 @@ class MeasurementFragment : Fragment() {
             axisLeft.setDrawGridLines(true)
 
             data = LineData().apply {
-                setDrawValues(false) //  데이터 전체 값 텍스트 OFF
+                setDrawValues(false)
             }
 
             invalidate()
         }
     }
+
     private fun setupButtons() {
-        // 초기: 연결 버튼만 보이게
         setButtonsConnected(false)
 
         binding.buttonBluetoothConnect.setOnClickListener {
@@ -167,7 +174,6 @@ class MeasurementFragment : Fragment() {
         }
 
         binding.buttonZeroContainer.setOnClickListener {
-            // 영점=캘리브레이션으로 연결 (문서에 따라 바뀌면 여기만 변경)
             bleJsonClient?.sendCalibrate()
             bleJsonClient?.sendGetStatus()
         }
@@ -176,6 +182,7 @@ class MeasurementFragment : Fragment() {
             bleJsonClient?.sendStartMeasurement()
         }
 
+        // ✅ Save Result(End and Save): 저장 성공 시 전체 리셋
         binding.buttonEndAndSaveContainer.setOnClickListener {
             bleJsonClient?.sendStopMeasurement()
             bleJsonClient?.sendResetSystem()
@@ -184,9 +191,12 @@ class MeasurementFragment : Fragment() {
             showSaveDialogAndPersist(tabIndex)
         }
     }
+
     private fun showSaveDialogAndPersist(tabIndex: Int) {
         val frame = viewModel.latestDFrame ?: run {
             Toast.makeText(requireContext(), "저장할 데이터가 없습니다.", Toast.LENGTH_SHORT).show()
+            // 버튼을 눌렀으니 "새 측정 준비"로 리셋하는게 원하면 아래 주석 해제
+            // viewModel.resetAllAfterSaveResult()
             return
         }
 
@@ -221,7 +231,6 @@ class MeasurementFragment : Fragment() {
                     return@setPositiveButton
                 }
 
-                //  파일명 생성 (AA01-260127-T2-5-01)
                 val filename = com.coremotion.perik3.util.MeasurementFileNameUtil.buildFileName(
                     patientId = patientId,
                     tabIndex = tabIndex,
@@ -229,7 +238,6 @@ class MeasurementFragment : Fragment() {
                     prefs = prefs
                 )
 
-                //  “화면 스냅샷” (로그/그래프 일부 + latestFrameRaw 포함)
                 val snapshot = viewModel.buildSnapshotJsonString()
 
                 prefs.edit()
@@ -242,10 +250,14 @@ class MeasurementFragment : Fragment() {
                 Log.d("SAVE", "filename=$filename")
                 Log.d("SAVE", "snapshot=${snapshot.take(200)}...")
                 Toast.makeText(ctx, "저장됨: $filename", Toast.LENGTH_LONG).show()
+                viewModel.resetAllResults()
+                // ✅ 저장 완료 → “모든 데이터(리스트/텍스트/그래프/peak/p결과)” 리셋
+                viewModel.resetAllAfterSaveResult()
             }
             .setNegativeButton("취소", null)
             .show()
     }
+
     private fun setButtonsConnected(connected: Boolean) {
         binding.buttonBluetoothConnect.visibility = if (connected) View.GONE else View.VISIBLE
         binding.buttonZeroContainer.visibility = if (connected) View.VISIBLE else View.GONE
@@ -293,36 +305,55 @@ class MeasurementFragment : Fragment() {
 
         viewModel.selectedTab.observe(viewLifecycleOwner) { tab ->
             binding.lineChartRealtime.description.text = if (tab == 2) {
-                "Y: Lift Displacement (LD), X: t"
+                "Y: posY (py), X: t"
             } else {
                 "Y: Force (N), X: t"
+            }
+
+            binding.chartYAxisLabel.text = when (tab) {
+                1 -> "Force (N)"
+                2 -> "Ventral displacement (mm)"
+                else -> ""
             }
             binding.lineChartRealtime.invalidate()
         }
 
-// T2 Overlay (5좌표) - 점만 표시(화살표는 T2에서 안 씀)
+        // T2 Overlay
         viewModel.t2OverlayPoint.observe(viewLifecycleOwner) { p ->
             if (p != null) {
                 binding.overlayMarkerDirectionViewT2.updateNormalizedPoint(p.x, p.y)
-                binding.overlayMarkerDirectionViewT2.updateDirectionVector(0f, 0f, false) // 방향 OFF
+                binding.overlayMarkerDirectionViewT2.updateDirectionVector(0f, 0f, false)
+                binding.overlayMarkerDirectionViewT2.setMarkerVisible(true)
             }
         }
 
-//  T3 Overlay (3좌표) - 점 표시
+        // T3 Overlay
         viewModel.t3OverlayPoint.observe(viewLifecycleOwner) { p ->
             if (p != null) {
                 binding.overlayMarkerDirectionViewT3.updateNormalizedPoint(p.x, p.y)
                 binding.overlayMarkerDirectionViewT3.setMarkerVisible(true)
-
             }
         }
 
-//  T3 Arrow direction (r 기반) - 점이 있을 때만 화살표 ON
+        // T3 Arrow
         viewModel.t3DirectionVec.observe(viewLifecycleOwner) { v ->
-            val markerVisibleNow = binding.overlayMarkerDirectionViewT3.visibility == View.VISIBLE
-            if (v != null && markerVisibleNow) {
+            if (v != null) {
                 binding.overlayMarkerDirectionViewT3.updateDirectionVector(v.dx, v.dy, true)
+            } else {
+                binding.overlayMarkerDirectionViewT3.updateDirectionVector(0f, 0f, false)
             }
+        }
+
+        viewModel.t3LvText.observe(viewLifecycleOwner) { text ->
+            binding.sixCellBipolarGraphViewT3.setBottomValueText(text)
+        }
+
+        // ✅ 요약 텍스트 (T2/T3)
+        viewModel.summaryText.observe(viewLifecycleOwner) { text ->
+            binding.peakVelocityText.text = text
+            val tab = viewModel.selectedTab.value ?: 0
+            binding.peakVelocityText.visibility =
+                if (tab == 0 || text.isBlank()) View.GONE else View.VISIBLE
         }
     }
 
@@ -358,9 +389,7 @@ class MeasurementFragment : Fragment() {
         val maxX = safe.last().x
 
         chart.xAxis.axisMinimum = minX
-        chart.xAxis.axisMaximum = maxX + 0.1f  // 오른쪽 여백 조금
-
-
+        chart.xAxis.axisMaximum = maxX + 0.1f
         chart.invalidate()
     }
 
@@ -376,16 +405,12 @@ class MeasurementFragment : Fragment() {
         client.startScanAndConnect(adapter, object : BleJsonClient.Callback {
 
             override fun onLog(logLine: String) {
-              //  Log.d("PeriK3_UI", "onLog len=${logLine.length} data=${logLine.take(800)}")
-                //  이제 200ms마다 JSON 묶음 1줄만 들어옴
-                // 필요하면 listViewRealtimeLogs에도 표시
-                // viewModel.addBleLog(logLine) 같은 식으로 연결해도 됨
+                // 필요하면 로그 표시 연결
             }
 
             override fun onConnectionStateChanged(isConnected: Boolean) {
-                android.util.Log.d("PeriK3_UI", "BLE connected=$isConnected")
+                Log.d("PeriK3_UI", "BLE connected=$isConnected")
                 setButtonsConnected(isConnected)
-                // 버튼 visible 토글도 여기서 하던 기존 로직 유지하면 됨
             }
 
             override fun onJsonStringReceived(jsonString: String) {
@@ -397,14 +422,12 @@ class MeasurementFragment : Fragment() {
 
     private fun applyLogHeader(tab: Int) {
         if (tab == 2) {
-            // T3
             binding.tvHeaderC1.text = "Timestamp"
             binding.tvHeaderC2.text = "x"
             binding.tvHeaderC3.text = "y"
             binding.tvHeaderC4.text = "Lift Displacement"
             binding.tvHeaderC5.text = "Rotation"
         } else {
-            // T1/T2
             binding.tvHeaderC1.text = "Timestamp"
             binding.tvHeaderC2.text = "State"
             binding.tvHeaderC3.text = "Force"

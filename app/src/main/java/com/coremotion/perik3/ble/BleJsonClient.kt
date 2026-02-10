@@ -14,9 +14,9 @@ import android.util.Log
 import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.nio.CharBuffer
-import java.nio.charset.CharsetDecoder
-import java.nio.charset.CoderResult
 import java.nio.charset.Charset
+import java.nio.charset.CharsetDecoder
+import java.nio.charset.CodingErrorAction
 import java.util.UUID
 
 class BleJsonClient(
@@ -39,11 +39,10 @@ class BleJsonClient(
     private val scanTimeoutMillis: Long = 15_000L
 
     // UI로 전달하는 flush 주기
-    // NOTE: 0으로 두면 postDelayed가 즉시 재실행되어 worker/main 모두를 폭주시킬 수 있음
-    private val flushIntervalMs: Long = 80L
+    private val flushIntervalMs: Long = 10L
     private val minFlushIntervalMs: Long = 20L
 
-    // MTU/우선순위 요청 값 (상대/단말이 허용하면 더 큰 payload로 수신 가능)
+    // MTU/우선순위 요청 값
     private val desiredMtu: Int = 247
 
     // ============================================================
@@ -84,7 +83,7 @@ class BleJsonClient(
     // ============================================================
     private val rxBuffer = StringBuilder()
 
-    //  정상 JSON 큐 (유실 방지). worker thread only
+    // 정상 JSON 큐 (유실 방지). worker thread only
     private val validJsonQueue: ArrayDeque<String> = ArrayDeque()
     private val maxValidJsonQueued = 500
 
@@ -92,28 +91,31 @@ class BleJsonClient(
     private val pendingLogs: ArrayDeque<String> = ArrayDeque()
 
     // 버퍼 폭주 방지
-    private val maxRxBufferChars = 200_000
-    private val keepTailChars = 20_000
+    private val maxRxBufferChars = 2000_000
+    private val keepTailChars = 2000_000
 
-    // RAW RX 전체를 모으는 버퍼 (worker thread only)
-    private val rawRxDumpBuffer = StringBuilder()
-    private val maxRawDumpChars = 100_000
-    private val keepRawDumpTail = 20_000
-
+    // RAW RX 디버그
     private val rawDumpBuffer = ArrayDeque<String>()
     private val maxRawDumpLinesPerFlush = 30
-
-    // 임시: RAW 수신(쓰레기 포함) 로그 출력/전달
     private val debugDumpRawRxToLogcat: Boolean = true
 
     // ============================================================
-    // UTF-8 스트리밍 디코더 (BLE 패킷 경계에서 멀티바이트가 잘려도 안전)
+    // ✅ 개선 1) notification마다 post 폭주 방지: ByteArray 큐 + drain 방식
+    // ============================================================
+    private val pendingByteChunks: ArrayDeque<ByteArray> = ArrayDeque()
+    @Volatile private var drainScheduled = false
+
+    // ============================================================
+    // ✅ 개선 2) UTF-8 스트리밍 디코더 안정화 (REPLACE 모드 + carry)
     // ============================================================
     private val utf8Decoder: CharsetDecoder = Charsets.UTF_8.newDecoder()
-    private var utf8CarryBytes: ByteArray = ByteArray(16)
+        .onMalformedInput(CodingErrorAction.REPLACE)
+        .onUnmappableCharacter(CodingErrorAction.REPLACE)
+
+    private var utf8CarryBytes: ByteArray = ByteArray(32)
     private var utf8CarryLen: Int = 0
 
-    private fun decodeUtf8Streaming(bytes: ByteArray): String {
+    private fun decodeUtf8StreamingSafe(bytes: ByteArray): String {
         val merged = if (utf8CarryLen > 0) {
             ByteArray(utf8CarryLen + bytes.size).also {
                 System.arraycopy(utf8CarryBytes, 0, it, 0, utf8CarryLen)
@@ -123,14 +125,15 @@ class BleJsonClient(
             bytes
         }
 
+        // reset해도 OK: carry를 직접 붙여서 프레임 경계 문제를 해결함
         utf8Decoder.reset()
 
         val inBuf = ByteBuffer.wrap(merged)
         val outBuf = CharBuffer.allocate(merged.size)
 
-        val result: CoderResult = utf8Decoder.decode(inBuf, outBuf, false)
-        // result는 보통 UNDERFLOW. 에러가 나면 상위에서 catch로 hex fallback
+        utf8Decoder.decode(inBuf, outBuf, false)
 
+        // 남은 바이트(underflow)는 carry로 보관
         val remaining = inBuf.remaining()
         if (remaining > 0) {
             if (utf8CarryBytes.size < remaining) {
@@ -161,7 +164,6 @@ class BleJsonClient(
         }
     }
 
-    // flush 루프(고정 주기) : “한번 꼬이면 멈춤” 방지
     @Volatile private var flushLoopStarted = false
     private val flushRunnable = object : Runnable {
         override fun run() {
@@ -299,7 +301,6 @@ class BleJsonClient(
                 enqueueLog("GATT CONNECTED: name=$lastSelectedDeviceName addr=$lastSelectedDeviceAddress rssi=$lastSelectedDeviceRssi")
                 safePostMain { currentCallback?.onConnectionStateChanged(true) }
 
-                // 연결 직후: 가능한 경우 우선순위/PHY/MTU 요청
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                     try {
                         val prioOk = gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
@@ -311,7 +312,7 @@ class BleJsonClient(
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     try {
-                        // 0 = PHY 옵션 없음(= no preferred)
+                        // PHY_OPTION_NO_PREFERRED 상수 없으면 0 쓰는게 맞음
                         gatt.setPreferredPhy(
                             BluetoothDevice.PHY_LE_2M,
                             BluetoothDevice.PHY_LE_2M,
@@ -368,16 +369,32 @@ class BleJsonClient(
             enqueueLog("onMtuChanged mtu=$mtu status=$status")
         }
 
-        @Deprecated("Android 12 이하 호환")
-        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            characteristic.value?.let { handleIncomingBytes(it) }
-        }
+        /*        @Deprecated("Android 12 이하 호환")
+                override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+                    characteristic.value?.let { handleIncomingBytes(it) }
+                }*/
 
+        /*   override fun onCharacteristicChanged(
+               gatt: BluetoothGatt,
+               characteristic: BluetoothGattCharacteristic,
+               value: ByteArray
+           ) {
+               handleIncomingBytes(value)
+           }*/
+        // gattCallback 내부 수정
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
-            value: ByteArray
+            value: ByteArray // 최신 API 기준
         ) {
+            // 1. 바이트를 그대로 스트링으로 변환 (디코딩 실패 대비)
+            val rawString = String(value, Charsets.UTF_8)
+
+            // 2. 패킷의 길이와 내용을 즉시 로그로 출력
+            // [RAW_RX] 표시를 붙여서 필터링하기 쉽게 합니다.
+            Log.d("PeriK3_RAW", "Size: ${value.size} | Data: $rawString")
+
+            // 기존의 worker 처리 로직 호출
             handleIncomingBytes(value)
         }
 
@@ -427,29 +444,45 @@ class BleJsonClient(
     // RX 처리 (worker thread)
     // ============================================================
     private fun handleIncomingBytes(value: ByteArray) {
-        workerHandler.post {
+        // ✅ drain 방식: post 폭주 방지
+        synchronized(pendingByteChunks) {
+            pendingByteChunks.addLast(value.clone())
+        }
+        if (!drainScheduled) {
+            drainScheduled = true
+            workerHandler.post {
+                drainScheduled = false
+                drainIncomingWorker()
+            }
+        }
+    }
+
+    private fun drainIncomingWorker() {
+        while (true) {
+            val bytes: ByteArray = synchronized(pendingByteChunks) {
+                if (pendingByteChunks.isEmpty()) return
+                pendingByteChunks.removeFirst()
+            }
+
+            // ✅ 디코딩은 REPLACE 모드라 웬만하면 안전하게 문자열이 나옴
             val chunk = try {
-                decodeUtf8Streaming(value)
-            } catch (_: Exception) {
-                // UTF-8 디코딩 실패 시 hex로 fallback
-                value.joinToString(" ") { "%02X".format(it) }
-            }
-            if (chunk.isEmpty()) return@post
-
-            // RAW 전체 누적(쓰레기 포함)
-            rawRxDumpBuffer.append(chunk)
-            if (rawRxDumpBuffer.length > maxRawDumpChars) {
-                rawRxDumpBuffer.delete(0, rawRxDumpBuffer.length - keepRawDumpTail)
-                enqueueLog("RAW RX dump trimmed")
+                decodeUtf8StreamingSafe(bytes)
+            } catch (e: Exception) {
+                // ✅ 중요: 여기서 hex 문자열을 rxBuffer에 넣으면 파서가 망가진다.
+                // 디버그 로그만 남기고 버림.
+                enqueueLog("UTF-8 decode exception. drop chunk size=${bytes.size} err=${e.message}")
+                continue
             }
 
-            // JSON 파서용 버퍼
-            rxBuffer.append(chunk)
+            if (chunk.isEmpty()) continue
 
+            // RAW debug line 저장(너무 길면 잘라서)
             synchronized(rawDumpBuffer) {
-                rawDumpBuffer.addLast(chunk)
+                rawDumpBuffer.addLast(if (chunk.length > 800) chunk.take(800) + "..." else chunk)
                 while (rawDumpBuffer.size > 300) rawDumpBuffer.removeFirst()
             }
+
+            rxBuffer.append(chunk)
 
             if (rxBuffer.length > maxRxBufferChars) {
                 rxBuffer.delete(0, rxBuffer.length - keepTailChars)
@@ -461,13 +494,11 @@ class BleJsonClient(
     }
 
     // ============================================================
-    // 좀비 데이터 자동 복구 파서
-    // - '{'부터 '}'까지 괄호 깊이로 추출
-    // - 너무 길게 닫히지 않으면 '{' 하나 버리고 재동기화
+    // JSON 파서 (좀비 자동 복구)
     // ============================================================
     private fun extractJsonObjectsFromBufferWorker() {
         var loopSafetyCount = 0
-        val maxLoopsPerCall = 100
+        val maxLoopsPerCall = 500
 
         val maxSingleJsonLength = 4096
 
@@ -476,8 +507,8 @@ class BleJsonClient(
 
             val start = indexOfChar(rxBuffer, '{', 0)
 
-            // '{'가 없으면 대기. 단 쓰레기 폭주 방지.
             if (start < 0) {
+                // '{'가 아예 없으면 쓰레기만 쌓인 상태일 수 있음 → 꼬리만 유지
                 if (rxBuffer.length > keepTailChars) {
                     rxBuffer.delete(0, rxBuffer.length - keepTailChars)
                     Log.w("PeriK3_BLE_RAW", "Garbage trimmed (No '{' found)")
@@ -485,8 +516,8 @@ class BleJsonClient(
                 return
             }
 
-            // '{' 앞 쓰레기 제거
             if (start > 0) {
+                // '{' 이전 쓰레기 제거
                 rxBuffer.delete(0, start)
                 continue
             }
@@ -523,14 +554,13 @@ class BleJsonClient(
                 }
             }
 
-            // 닫힘이 없고 버퍼가 너무 길면 좀비로 판단하고 재동기화
+            // 닫힘이 없고 너무 길면 좀비로 보고 재동기화
             if (endIndex < 0 && rxBuffer.length > maxSingleJsonLength) {
-                Log.e("PeriK3_BLE_RAW", " JSON Too Long/Corrupted (Zombie data). Dropping '{' and resync.")
+                Log.e("PeriK3_BLE_RAW", "JSON Too Long/Corrupted. Drop '{' and resync.")
                 rxBuffer.delete(0, 1)
                 continue
             }
 
-            // 아직 닫는 괄호가 안 옴 (수신 중)
             if (endIndex < 0) return
 
             val json = rxBuffer.substring(0, endIndex + 1).trim()
@@ -554,17 +584,16 @@ class BleJsonClient(
                     }
                 }
                 if (debugDumpRawRxToLogcat) {
-                    Log.d("PeriK3_BLE_RAW", "JSON OK: ${json.take(80)}...")
+                    Log.d("PeriK3_BLE_RAW", "JSON OK: ${json.take(120)}...")
                 }
             } else {
-                Log.w("PeriK3_BLE_RAW", "Broken JSON Skipped")
+                Log.w("PeriK3_BLE_RAW", "Broken JSON Skipped: ${json.take(120)}")
             }
         }
     }
 
     // ============================================================
-    // flush (worker -> main) : 고정 주기
-    // - 정상 JSON을 “마지막 1개만”이 아니라 여러 개 전달 (유실 방지)
+    // flush (worker -> main)
     // ============================================================
     private fun flushOnceWorker() {
         val logs = mutableListOf<String>()
@@ -582,7 +611,8 @@ class BleJsonClient(
 
         val jsonsToDeliver = mutableListOf<String>()
         synchronized(validJsonQueue) {
-            val maxPerFlush = 25
+            // ✅ 메인 스레드 폭주 방지: 한 번에 너무 많이 보내지 않기
+            val maxPerFlush = 10
             while (validJsonQueue.isNotEmpty() && jsonsToDeliver.size < maxPerFlush) {
                 jsonsToDeliver.add(validJsonQueue.removeFirst())
             }
@@ -593,12 +623,10 @@ class BleJsonClient(
 
         safePostMain {
             try {
-                // 1) 일반 BLE_LOG
                 if (logs.isNotEmpty()) {
                     cb.onLog(buildBleLogPayload(logs))
                 }
 
-                // 2) RAW_DUMP (디버그용) - 최소 escape만
                 if (rawLines.isNotEmpty()) {
                     val joined = rawLines.joinToString("\n")
                     val safe = joined
@@ -608,7 +636,6 @@ class BleJsonClient(
                     cb.onLog("{\"type\":\"BLE_RAW_DUMP\",\"lines\":${rawLines.size},\"data\":\"$safe\"}")
                 }
 
-                // 3) 정상 JSON들 (유실 방지)
                 if (jsonsToDeliver.isNotEmpty()) {
                     for (j in jsonsToDeliver) {
                         cb.onJsonStringReceived(j)
@@ -648,7 +675,7 @@ class BleJsonClient(
     }
 
     // ============================================================
-    // TX (기존 유지)
+    // TX
     // ============================================================
     @SuppressLint("MissingPermission")
     fun writeAsciiCommand(commandString: String): Boolean {
@@ -696,7 +723,13 @@ class BleJsonClient(
     fun sendGetStatus(): Boolean = sendMcuCommandPacket(commandId = 3)
     fun sendSetMode(stateId: Int = 0, param1: Int = 0, param2: Int = 0): Boolean =
         sendMcuCommandPacket(commandId = 4, stateId = stateId, parameter1 = param1, parameter2 = param2)
-    fun sendCalibrate(): Boolean = sendMcuCommandPacket(commandId = 5)
+    fun sendCalibrate(): Boolean =
+        sendMcuCommandPacket(
+            commandId = 5,
+            stateId = 3,
+            parameter1 = 0,
+            parameter2 = 0
+        )
     fun sendGetState(stateId: Int = 0): Boolean = sendMcuCommandPacket(commandId = 6, stateId = stateId)
 
     // ============================================================
@@ -711,6 +744,13 @@ class BleJsonClient(
         subscribedNotifyCharacteristic = null
         discoveredWriteCharacteristic = null
         isConnecting = false
+
+        // 수신 관련 상태도 리셋
+        synchronized(pendingByteChunks) { pendingByteChunks.clear() }
+        synchronized(validJsonQueue) { validJsonQueue.clear() }
+        synchronized(rawDumpBuffer) { rawDumpBuffer.clear() }
+        rxBuffer.clear()
+        utf8CarryLen = 0
     }
 
     companion object {

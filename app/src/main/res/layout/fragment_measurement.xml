@@ -145,16 +145,35 @@
 
         </androidx.constraintlayout.widget.ConstraintLayout>
         <!-- 그래프(LineChart) -->
-        <com.github.mikephil.charting.charts.LineChart
-            android:id="@+id/lineChartRealtime"
+
+        <FrameLayout
             android:layout_width="0dp"
-            android:layout_height="160dp"
+            android:layout_height="180dp"
             app:layout_constraintTop_toBottomOf="@id/constraintLayoutHeader"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintBottom_toTopOf="@id/linearLayoutButtons"
             android:layout_marginTop="10dp"
-            android:layout_marginBottom="10dp"/>
+            android:layout_marginBottom="10dp">
+
+            <com.github.mikephil.charting.charts.LineChart
+                android:id="@+id/lineChartRealtime"
+                android:layout_width="match_parent"
+                android:layout_gravity="bottom"
+                android:layout_height="160dp"/>
+
+            <!-- Y축 설명 텍스트 -->
+            <TextView
+                android:id="@+id/chartYAxisLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="top|start"
+                android:paddingStart="8dp"
+                android:paddingTop="4dp"
+                android:textSize="12sp"
+                android:textColor="#666666"
+                android:text=""/>
+        </FrameLayout>
         <!-- 버튼 영역 -->
         <LinearLayout
             android:id="@+id/linearLayoutButtons"
@@ -353,11 +372,21 @@
             android:layout_width="0dp"
             android:layout_height="0dp"
             app:layout_constraintTop_toBottomOf="@id/layoutLogHeader"
-            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintBottom_toTopOf="@id/peakVelocityText"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintEnd_toEndOf="parent"
             android:divider="#333333"
             android:dividerHeight="1dp"/>
+        <TextView
+            android:id="@+id/peakVelocityText"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:text="Peak lift : 3mm\npeak movement velocity : 3mm/s"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintEnd_toEndOf="parent"
+            android:paddingBottom="4dp"
+            android:paddingTop="4dp"/>
 
     </androidx.constraintlayout.widget.ConstraintLayout>
 

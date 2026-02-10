@@ -13,18 +13,23 @@ class SixCellBipolarGraphView @JvmOverloads constructor(
     attrs: AttributeSet? = null
 ) : View(context, attrs) {
 
-    // -1..+1
+    // -1..+1 (LD 기반)
     private var targetNormalizedValue: Float = 0f
     private var animatedNormalizedValue: Float = 0f
 
     // 표시 텍스트
     private var labelText: String = "T3"
-    private var unitText: String = ""          //  단위는 하단에
-    private var showValueText: Boolean = false // 필요하면 true로
+    private var unitText: String = ""           // 하단 단위
+    private var bottomValueText: String = ""    // ✅ LV 표시용 (예: "3.1 mm/s")
 
     fun setLabel(text: String) { labelText = text; invalidate() }
     fun setUnit(text: String) { unitText = text; invalidate() }
-    fun setShowValueText(show: Boolean) { showValueText = show; invalidate() }
+
+    // ✅ 추가
+    fun setBottomValueText(text: String) {
+        bottomValueText = text
+        invalidate()
+    }
 
     private val cellOffPaint: Paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -41,7 +46,6 @@ class SixCellBipolarGraphView @JvmOverloads constructor(
         color = 0xFFE57373.toInt()
     }
 
-    //  기준선(구분선): 검은색
     private val dividerPaint: Paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 3f
@@ -49,7 +53,6 @@ class SixCellBipolarGraphView @JvmOverloads constructor(
         alpha = 200
     }
 
-    // 텍스트(+/-/라벨/단위): 검은색
     private val textPaint: Paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0xFF000000.toInt()
         alpha = 220
@@ -85,29 +88,39 @@ class SixCellBipolarGraphView @JvmOverloads constructor(
         super.onDraw(canvas)
 
         val cellCount = 6
-        val positiveCellCount = 4  // 위 4칸 (+)
-        val negativeCellCount = 2  // 아래 2칸 (-)
+        val positiveCellCount = 4
+        val negativeCellCount = 2
 
-        //  “셀 밖 텍스트”를 위한 여백
-        val sideGutter = 16f          // 좌측(+/-) 영역
-        val topLabelH = 22f           // 상단 라벨 영역(선택)
-        val bottomUnitH = 22f         // 하단 단위 영역
+        val sideGutter = 16f
+        val topLabelH = 22f
 
-        // 셀 그릴 수 있는 영역(텍스트 영역 제외)
+        // ===== 하단 텍스트 영역 =====
+        val unitH = if (unitText.isNotBlank()) 22f else 0f
+        val valueH = if (bottomValueText.isNotBlank()) 22f else 0f
+
+        // ✅ unit ↔ value 사이 패딩
+        val bottomTextPadding = 8f
+
+        val bottomReserved =
+            unitH +
+                    valueH +
+                    if (unitH > 0f && valueH > 0f) bottomTextPadding else 0f
+
+        // ===== 콘텐츠 영역 =====
         val contentLeft = sideGutter
         val contentRight = width.toFloat()
         val contentTop = topLabelH
-        val contentBottom = height.toFloat() - bottomUnitH
+        val contentBottom = height.toFloat() - bottomReserved
 
         val contentW = (contentRight - contentLeft).coerceAtLeast(1f)
         val contentH = (contentBottom - contentTop).coerceAtLeast(1f)
 
         val gapPx = 10f
         val totalGapHeight = gapPx * (cellCount - 1)
-        val cellHeight = (contentH - totalGapHeight) / cellCount.toFloat()
+        val cellHeight = (contentH - totalGapHeight) / cellCount
         val cellWidth = contentW
 
-        // 어떤 셀을 켤지 계산
+        // ===== 셀 활성 계산 =====
         val shouldFillCell = BooleanArray(cellCount) { false }
 
         val value = animatedNormalizedValue
@@ -116,18 +129,18 @@ class SixCellBipolarGraphView @JvmOverloads constructor(
         if (value >= 0f) {
             val filled = (magnitude * positiveCellCount).toInt().coerceIn(0, positiveCellCount)
             for (step in 0 until filled) {
-                val idx = (positiveCellCount - 1) - step // 3,2,1,0
+                val idx = (positiveCellCount - 1) - step
                 if (idx in 0 until cellCount) shouldFillCell[idx] = true
             }
         } else {
             val filled = (magnitude * negativeCellCount).toInt().coerceIn(0, negativeCellCount)
             for (step in 0 until filled) {
-                val idx = positiveCellCount + step // 4,5
+                val idx = positiveCellCount + step
                 if (idx in 0 until cellCount) shouldFillCell[idx] = true
             }
         }
 
-        // 셀 그리기(위->아래)
+        // ===== 셀 그리기 =====
         for (i in 0 until cellCount) {
             val cellTop = contentTop + i * (cellHeight + gapPx)
             val cellBottom = cellTop + cellHeight
@@ -139,41 +152,51 @@ class SixCellBipolarGraphView @JvmOverloads constructor(
             }
 
             canvas.drawRoundRect(
-                contentLeft, cellTop,
-                contentLeft + cellWidth, cellBottom,
-                14f, 14f, paint
+                contentLeft,
+                cellTop,
+                contentLeft + cellWidth,
+                cellBottom,
+                14f,
+                14f,
+                paint
             )
         }
 
-        //  기준선(4칸/2칸 경계) 검은색
-        val boundaryBottomOfIndex3 = contentTop + (positiveCellCount - 1) * (cellHeight + gapPx) + cellHeight
+        // ===== 기준선 =====
+        val boundaryBottomOfIndex3 =
+            contentTop + (positiveCellCount - 1) * (cellHeight + gapPx) + cellHeight
         val dividerY = boundaryBottomOfIndex3 + (gapPx / 2f)
         canvas.drawLine(contentLeft, dividerY, contentLeft + cellWidth, dividerY, dividerPaint)
 
-        // + / - : 셀 밖(좌측 여백)에 검은색
-        // +는 위쪽, -는 아래쪽에 배치
+        // ===== + / - =====
         canvas.drawText("+", 3f, contentTop + 18f, textPaint)
         canvas.drawText("-", 4f, contentBottom - 6f, textPaint)
 
-        // (선택) 라벨은 상단 우측에
+        // ===== 라벨 =====
         if (labelText.isNotBlank()) {
             val w = smallTextPaint.measureText(labelText)
-            canvas.drawText(labelText, (width - w - 4f).coerceAtLeast(contentLeft), contentTop - 4f, smallTextPaint)
+            canvas.drawText(
+                labelText,
+                (width - w - 4f).coerceAtLeast(contentLeft),
+                contentTop - 4f,
+                smallTextPaint
+            )
         }
 
-        //  단위는 하단 중앙 (T2/T3 공통 요구)
+        // ===== (위) unitText =====
         if (unitText.isNotBlank()) {
             val uw = smallTextPaint.measureText(unitText)
             val x = (width - uw) / 2f
-            val y = height.toFloat() - 6f
+            val y = height.toFloat() - valueH - bottomTextPadding - 6f
             canvas.drawText(unitText, x, y, smallTextPaint)
         }
 
-        // (선택) 값 표시를 하단 위쪽에 (원하면)
-        if (showValueText) {
-            val vText = String.format("%.2f", value)
-            val vw = smallTextPaint.measureText(vText)
-            canvas.drawText(vText, (width - vw) / 2f, dividerY - 6f, smallTextPaint)
+        // ===== (최하단) LV 값 =====
+        if (bottomValueText.isNotBlank()) {
+            val vw = smallTextPaint.measureText(bottomValueText)
+            val x = (width - vw) / 2f
+            val y = height.toFloat() - 6f
+            canvas.drawText(bottomValueText, x, y, smallTextPaint)
         }
     }
 }
